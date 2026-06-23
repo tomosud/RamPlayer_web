@@ -16,6 +16,9 @@
 
 * { box-sizing: border-box; }
 
+/* hidden 属性を確実に効かせる（.drop-hint 等が display を上書きするため）。 */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   height: 100%;
