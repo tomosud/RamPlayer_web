@@ -63,6 +63,13 @@ export class Player {
   private perfStart = 0;
   private perfMediaStart = 0;
 
+  // シーク合体（スクラブ中の連続シークを最新位置だけにまとめる）
+  private seekRunning = false;
+  private pendingSeekTime: number | null = null;
+
+  // 再生中、デコードが追いつかず大きく遅れたときの再同期スロットル
+  private lastResyncMs = 0;
+
   constructor(
     private canvas: HTMLCanvasElement,
     private callbacks: PlayerCallbacks,
@@ -180,10 +187,13 @@ export class Player {
     this.playing = false;
     if (this.raf) cancelAnimationFrame(this.raf);
     this.raf = 0;
-    if (this.audio) {
-      this.audio.stop();
-      this.currentTime = this.audio.mediaTime;
-    }
+    const clk = this.audio ? this.audio.mediaTime : this.currentTime;
+    if (this.audio) this.audio.stop();
+    // 一時停止位置を「実際に表示しているフレーム」へ合わせる。
+    // 音声がデコードより先行していても、見た目・時刻表示・コマ送りの起点を一致させる。
+    const f = this.cache ? this.cache.currentFrame(clk) : null;
+    this.currentTime = f ? f.timestamp : clk;
+    if (f) this.blit(f);
     this.callbacks.onState(false);
     this.callbacks.onTime(this.currentTime);
   }
@@ -230,16 +240,34 @@ export class Player {
       this.currentTime = t < this.inPoint ? this.inPoint : t;
       this.drawAt(this.currentTime);
       this.callbacks.onTime(this.currentTime);
+
+      // デコードがクロック（音声）に大きく追いつけない場合は、間のフレームを
+      // 全てデコードしようとせず現在位置から先読みし直して再同期する。
+      if (this.cache) {
+        const lag = this.currentTime - this.cache.decodingTo;
+        const now = performance.now();
+        if (lag > 0.75 && now - this.lastResyncMs > 500) {
+          this.lastResyncMs = now;
+          this.cache.prefetchFrom(this.currentTime);
+        }
+      }
     }
     this.raf = requestAnimationFrame(this.tick);
   };
 
   // ---- シーク / コマ送り ------------------------------------------------
 
-  /** 不連続なシーク（シークバー・In/Outジャンプ・復元）。 */
+  /**
+   * 不連続なシーク（シークバー・In/Outジャンプ・復元）。
+   * スクラブ中に高速で呼ばれても、実際のデコードは最新位置だけに合体させる
+   * （古いデコードは {@link FrameCache.invalidate} で打ち切られる）。
+   */
   async seek(time: number): Promise<void> {
     if (!this.cache) return;
-    time = clamp(time, 0, this.duration);
+    this.pendingSeekTime = clamp(time, 0, this.duration);
+    if (this.seekRunning) return;
+
+    this.seekRunning = true;
     const wasPlaying = this.playing;
     if (wasPlaying) {
       this.playing = false;
@@ -249,52 +277,72 @@ export class Player {
       this.callbacks.onState(false);
     }
 
-    this.currentTime = time;
-    this.cache.invalidate();
+    try {
+      while (this.pendingSeekTime !== null) {
+        const t = this.pendingSeekTime;
+        this.pendingSeekTime = null;
+        this.currentTime = t;
+        this.cache.invalidate();
 
-    let f = this.cache.currentFrame(time);
-    if (!f) f = await this.cache.decodeAt(time, -1);
-    if (f) this.blit(f);
-
-    this.cache.prefetchFrom(time);
-    this.callbacks.onTime(time);
+        let f = this.cache.currentFrame(t);
+        if (!f) f = await this.cache.decodeAt(t, -1);
+        if (f) this.blit(f);
+        this.callbacks.onTime(t);
+      }
+      this.cache.prefetchFrom(this.currentTime);
+    } finally {
+      this.seekRunning = false;
+    }
 
     if (wasPlaying) await this.play();
   }
 
-  async stepForward(): Promise<void> {
-    if (!this.cache) return;
-    this.pause();
-    const cur = this.cache.currentFrame(this.currentTime);
-    const baseTs = cur ? cur.timestamp : this.currentTime;
+  // コマ送りの再入防止（1080p等で1コマのデコードが間に合わない間の連打を無視）。
+  private stepping = false;
 
-    let nf = this.cache.nextCachedAfter(baseTs);
-    if (!nf) {
-      nf = await this.cache.decodeAt(baseTs, +1);
-      if (nf) this.cache.prefetchFrom(nf.timestamp);
-    }
-    if (nf) {
-      this.currentTime = Math.min(nf.timestamp, this.duration);
-      this.blit(nf);
-      this.callbacks.onTime(this.currentTime);
+  async stepForward(): Promise<void> {
+    if (!this.cache || this.stepping) return;
+    this.stepping = true;
+    try {
+      this.pause();
+      const cur = this.cache.currentFrame(this.currentTime);
+      const baseTs = cur ? cur.timestamp : this.currentTime;
+
+      let nf = this.cache.nextCachedAfter(baseTs);
+      if (!nf) {
+        nf = await this.cache.decodeAt(baseTs, +1);
+        if (nf) this.cache.prefetchFrom(nf.timestamp);
+      }
+      if (nf) {
+        this.currentTime = Math.min(nf.timestamp, this.duration);
+        this.blit(nf);
+        this.callbacks.onTime(this.currentTime);
+      }
+    } finally {
+      this.stepping = false;
     }
   }
 
   async stepBackward(): Promise<void> {
-    if (!this.cache) return;
-    this.pause();
-    const cur = this.cache.currentFrame(this.currentTime);
-    const baseTs = cur ? cur.timestamp : this.currentTime;
+    if (!this.cache || this.stepping) return;
+    this.stepping = true;
+    try {
+      this.pause();
+      const cur = this.cache.currentFrame(this.currentTime);
+      const baseTs = cur ? cur.timestamp : this.currentTime;
 
-    let pf = this.cache.prevCachedBefore(baseTs);
-    if (!pf) {
-      pf = await this.cache.decodeAt(baseTs - 1e-4, -1);
-      if (pf) this.cache.prefetchFrom(Math.max(0, pf.timestamp - this.cache.behindSec));
-    }
-    if (pf) {
-      this.currentTime = Math.max(0, pf.timestamp);
-      this.blit(pf);
-      this.callbacks.onTime(this.currentTime);
+      let pf = this.cache.prevCachedBefore(baseTs);
+      if (!pf) {
+        pf = await this.cache.decodeAt(baseTs - 1e-4, -1);
+        if (pf) this.cache.prefetchFrom(Math.max(0, pf.timestamp - this.cache.behindSec));
+      }
+      if (pf) {
+        this.currentTime = Math.max(0, pf.timestamp);
+        this.blit(pf);
+        this.callbacks.onTime(this.currentTime);
+      }
+    } finally {
+      this.stepping = false;
     }
   }
 

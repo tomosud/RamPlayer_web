@@ -34,6 +34,13 @@ export class FrameCache {
   /** 前方デコードループが動作中の世代（無ければ -1）。 */
   private fwdActiveGen = -1;
 
+  /**
+   * 現在動作中の sink イテレータ（= 内部の VideoDecoder）。
+   * 無効化時に明示的に return() して**デコーダを即座に解放**し、
+   * 連続シーク／コマ送りでデコーダが積み上がって OOM するのを防ぐ。
+   */
+  private activeIterators = new Set<AsyncGenerator<VideoSample, void, unknown>>();
+
   /** 前方デコードが到達した時刻（秒）。UI のデコード中表示に使う。 */
   decodingTo = 0;
 
@@ -49,10 +56,13 @@ export class FrameCache {
   ) {
     this.aheadSec = opts.aheadSec ?? 2;
     this.behindSec = opts.behindSec ?? 1;
-    const maxBytes = opts.maxBytes ?? 512 * 1024 * 1024;
+    // デコード済み VideoFrame は GPU/メモリを大きく消費し、保持しすぎると
+    // WebCodecs のデコーダプールを枯渇させてブラウザが Out of Memory で落ちる。
+    // そのため総メモリ量は控えめにし、解像度に応じて保持枚数を自動調整する。
+    const maxBytes = opts.maxBytes ?? 256 * 1024 * 1024;
     const bpf = opts.bytesPerFrame ?? 1280 * 720 * 1.5;
-    // 時間窓だけでなく総メモリ量でも上限を設ける。
-    this.maxFrames = Math.max(8, Math.min(2000, Math.floor(maxBytes / bpf)));
+    // 時間窓だけでなく総メモリ量・絶対枚数でも上限を設ける。
+    this.maxFrames = Math.max(8, Math.min(180, Math.floor(maxBytes / bpf)));
   }
 
   get size(): number {
@@ -180,60 +190,89 @@ export class FrameCache {
 
   // ---- 先読み -----------------------------------------------------------
 
-  /** 進行中のデコードループをすべて無効化する。 */
+  /** 進行中のデコードループをすべて無効化し、デコーダを即座に解放する。 */
   invalidate(): void {
     this.generation++;
     this.fwdActiveGen = -1;
+    // 動作中の全イテレータを閉じ、内部の VideoDecoder を解放する。
+    for (const it of this.activeIterators) {
+      void it.return();
+    }
+    this.activeIterators.clear();
   }
 
   /** 指定時刻を起点に前方先読み（＋直後の後方補填）を開始する。 */
   prefetchFrom(startSec: number): void {
+    // 既存のデコードを打ち切ってから開始し、デコーダの積み上がり（OOM要因）を防ぐ。
     this.generation++;
     const gen = this.generation;
+    for (const it of this.activeIterators) {
+      void it.return();
+    }
+    this.activeIterators.clear();
     void this.runForward(gen, startSec);
-    void this.runBehind(gen, Math.max(0, startSec - this.behindSec), startSec);
+    // 後方補填は2本目のデコーダを使うため、フレームが大きく保持枚数が少ない
+    // （= 高解像度）動画では行わない。後方コマ送りは getSample で対応する。
+    if (this.maxFrames >= 40) {
+      void this.runBehind(gen, Math.max(0, startSec - this.behindSec), startSec);
+    }
   }
 
   private async runForward(gen: number, startSec: number): Promise<void> {
     this.fwdActiveGen = gen;
     this.decodingTo = startSec;
+    const it = this.sink.samples(startSec, this.duration);
+    this.activeIterators.add(it);
     try {
-      for await (const s of this.sink.samples(startSec, this.duration)) {
+      for (;;) {
+        const next = await it.next();
+        if (next.done) break;
+        const s = next.value;
         if (gen !== this.generation) {
           s.close();
-          return;
+          break;
         }
         this.insert(s);
         this.decodingTo = s.timestamp + s.duration;
         this.evict();
 
         // バックプレッシャ：再生位置の +aheadSec より先はデコードしない。
-        // （samples() は next を呼ぶまで次をデコードしないため、ここで止めれば過剰デコードを防げる）
+        // （next を呼ぶまで次をデコードしないため、ここで止めれば過剰デコードを防げる）
         while (gen === this.generation && this.decodingTo > this.getCurrentTime() + this.aheadSec) {
           await delay(40);
         }
-        if (gen !== this.generation) return;
+        if (gen !== this.generation) break;
       }
     } catch {
       // 入力 dispose / シーク等で中断された場合は無視。
     } finally {
+      this.activeIterators.delete(it);
+      void it.return();
       if (this.fwdActiveGen === gen) this.fwdActiveGen = -1;
     }
   }
 
   private async runBehind(gen: number, fromSec: number, toSec: number): Promise<void> {
     if (toSec - fromSec <= 0) return;
+    const it = this.sink.samples(fromSec, toSec);
+    this.activeIterators.add(it);
     try {
-      for await (const s of this.sink.samples(fromSec, toSec)) {
+      for (;;) {
+        const next = await it.next();
+        if (next.done) break;
+        const s = next.value;
         if (gen !== this.generation) {
           s.close();
-          return;
+          break;
         }
         this.insert(s);
         this.evict();
       }
     } catch {
       /* 中断は無視 */
+    } finally {
+      this.activeIterators.delete(it);
+      void it.return();
     }
   }
 
