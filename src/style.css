@@ -139,6 +139,7 @@ html, body {
 .time-row .sep { color: var(--muted); }
 .time-row #totalTime { color: var(--muted); }
 .inout-label { margin-left: 12px; color: var(--accent); font-size: 12px; }
+.mem-usage { margin-left: auto; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 
 .controls {
   display: flex;

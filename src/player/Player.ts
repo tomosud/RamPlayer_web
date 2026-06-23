@@ -458,8 +458,11 @@ export class Player {
 
   /**
    * 指定位置の前後フレームをデコードしてキャッシュする。
-   * - full=false: 即時の小窓だけを1パスで確保（コマ送りの応答性優先・await して使う）。
-   * - full=true : 一時停止中の広い窓を容量上限まで段階的に確保（背景で void 実行）。
+   * - full=false: 即時の小窓だけを確保（コマ送りの応答性優先・await して使う）。
+   * - full=true : 一時停止中の広い窓を容量上限まで確保（背景で void 実行）。
+   *
+   * 既にキャッシュ済みの連続区間は再デコードせず、不足している外側だけを取得する。
+   * デコードループは一定時間ごとに制御を返し、先読み中も操作が固まらないようにする。
    */
   private async prefetchStepWindow(center: number, full = true): Promise<void> {
     if (!this.videoSink) return;
@@ -469,41 +472,94 @@ export class Player {
 
     const clampedCenter = this.clampToPlaybackRange(center);
     const targetRadius = full ? this.stepRadius : this.immediateRadius;
-    // 小窓から始めて倍々で広げる（内側が先に埋まり、コマ送りが早く効く）。
-    const baseSpan = Math.max(this.frameDuration * (this.immediateRadius + 6), 0.5);
-    const fullSpan = Math.max(this.frameDuration * (targetRadius + 6), baseSpan);
+    const span = Math.max(this.frameDuration * (targetRadius + 6), 0.5);
+    const wantFrom = Math.max(this.inPoint, clampedCenter - span);
+    const wantTo = Math.min(this.outPoint, clampedCenter + span);
+    this.stepDecodingFrom = clampedCenter;
+    this.stepDecodingTo = clampedCenter;
     try {
-      let span = baseSpan;
-      for (;;) {
-        if (gen !== this.stepGen) return;
-        const from = Math.max(this.inPoint, clampedCenter - span);
-        const to = Math.min(this.outPoint, clampedCenter + span);
-        this.stepDecodingFrom = from;
-        this.stepDecodingTo = from;
-
-        const it = this.videoSink.canvases(this.toMediaTime(from), this.toMediaTime(to));
-        try {
-          for (;;) {
-            const next = await it.next();
-            if (next.done || gen !== this.stepGen) break;
-            const frame = next.value;
-            const cached = this.storeWrappedCanvas(frame);
-            this.stepDecodingTo = Math.max(this.stepDecodingTo, cached.time + cached.duration);
-          }
-        } finally {
-          void it.return(undefined);
-        }
-
-        this.evictStepFrames(clampedCenter);
-        if (!full) break;
-        const haveEnough =
-          this.framesBehind(clampedCenter) >= targetRadius && this.framesAhead(clampedCenter) >= targetRadius;
-        if (haveEnough || span >= fullSpan) break;
-        span = Math.min(span * 2, fullSpan);
-      }
+      // 現在位置を含むキャッシュ済み連続区間の端を求め、その外側の不足分だけを取得する。
+      const aheadEdge = this.contiguousAheadEdge(clampedCenter);
+      const behindEdge = this.contiguousBehindEdge(clampedCenter);
+      // 前方の不足分 → 後方の不足分の順にデコード。
+      await this.decodeRange(gen, aheadEdge, wantTo);
+      if (gen !== this.stepGen) return;
+      await this.decodeRange(gen, wantFrom, behindEdge);
     } finally {
       if (gen === this.stepGen) this.stepDecoding = false;
     }
+  }
+
+  /**
+   * `[from, to)` をデコードしてキャッシュへ追加する。
+   * - 既にキャッシュ済みのフレームはコピーを作らずスキップ（再取得コストを抑える）。
+   * - 6ms ごとに `await delay(0)` で制御を返し、入力・描画をブロックしない。
+   */
+  private async decodeRange(gen: number, from: number, to: number): Promise<void> {
+    if (!this.videoSink) return;
+    from = Math.max(this.inPoint, from);
+    to = Math.min(this.outPoint, to);
+    if (to - from <= this.frameDuration * 0.5) return;
+
+    this.stepDecodingFrom = Math.min(this.stepDecodingFrom, from);
+    const it = this.videoSink.canvases(this.toMediaTime(from), this.toMediaTime(to));
+    let mark = performance.now();
+    let addedSinceEvict = 0;
+    try {
+      for (;;) {
+        const next = await it.next();
+        if (next.done || gen !== this.stepGen) break;
+        const frame = next.value;
+        const t = this.fromMediaTime(frame.timestamp);
+        const key = this.frameKey(t);
+        if (this.stepFrames.has(key)) {
+          // 既読フレームはデコードのみ進み、コピー・退避は行わない。
+          this.stepDecodingTo = Math.max(this.stepDecodingTo, t + frame.duration);
+        } else {
+          const cached = this.storeWrappedCanvas(frame);
+          this.stepDecodingTo = Math.max(this.stepDecodingTo, cached.time + cached.duration);
+          addedSinceEvict++;
+        }
+        if (performance.now() - mark > 6) {
+          if (addedSinceEvict > 0) {
+            this.evictStepFrames(this.currentTime);
+            addedSinceEvict = 0;
+          }
+          await delay(0);
+          mark = performance.now();
+          if (gen !== this.stepGen) break;
+        }
+      }
+    } catch {
+      // シーク・dispose による中断は無視。
+    } finally {
+      void it.return(undefined);
+      if (addedSinceEvict > 0) this.evictStepFrames(this.currentTime);
+    }
+  }
+
+  /** center を含むキャッシュ済み連続区間の上端時刻（無ければ center）。 */
+  private contiguousAheadEdge(center: number): number {
+    const gap = Math.max(this.frameDuration * 1.8, 0.08);
+    let t = center;
+    for (;;) {
+      const f = this.nextCachedFrame(t);
+      if (!f || f.time - t > gap) break;
+      t = f.time;
+    }
+    return t;
+  }
+
+  /** center を含むキャッシュ済み連続区間の下端時刻（無ければ center）。 */
+  private contiguousBehindEdge(center: number): number {
+    const gap = Math.max(this.frameDuration * 1.8, 0.08);
+    let t = center;
+    for (;;) {
+      const f = this.prevCachedFrame(t);
+      if (!f || t - f.time > gap) break;
+      t = f.time;
+    }
+    return t;
   }
 
   private storeWrappedCanvas(frame: WrappedCanvas): StepFrame {
@@ -743,6 +799,21 @@ export class Player {
 
   get decodingTo(): number {
     return this.stepDecoding ? this.stepDecodingTo : 0;
+  }
+
+  /** 現在キャッシュしているフレーム枚数。 */
+  get cacheFrameCount(): number {
+    return this.stepFrames.size;
+  }
+
+  /** フレームキャッシュの推定使用バイト数（枚数 × 1フレームbytes）。 */
+  get cacheBytes(): number {
+    return this.stepFrames.size * this.bytesPerFrame;
+  }
+
+  /** 現在状態でのフレームキャッシュ予算（バイト）。 */
+  get cacheBudgetBytes(): number {
+    return this.frameBudgetBytes;
   }
 
   stepStripFrames(): StepFrame[] {

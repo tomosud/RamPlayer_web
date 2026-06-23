@@ -29,6 +29,7 @@ const filmstripCanvas = $<HTMLCanvasElement>('filmstrip');
 const curTimeEl = $<HTMLSpanElement>('curTime');
 const totalTimeEl = $<HTMLSpanElement>('totalTime');
 const inOutLabel = $<HTMLSpanElement>('inOutLabel');
+const memUsage = $<HTMLSpanElement>('memUsage');
 
 const playPauseBtn = $<HTMLButtonElement>('playPause');
 const prevFrameBtn = $<HTMLButtonElement>('prevFrame');
@@ -196,6 +197,9 @@ function uiLoop(): void {
       decodingTo: player.decodingTo,
     });
     renderFilmstrip(player.stepStripFrames(), player.currentTime);
+    const usedMB = player.cacheBytes / (1024 * 1024);
+    const budgetMB = player.cacheBudgetBytes / (1024 * 1024);
+    memUsage.textContent = `RAM ${usedMB.toFixed(0)}MB / ${budgetMB.toFixed(0)}MB (${player.cacheFrameCount}f)`;
   }
   requestAnimationFrame(uiLoop);
 }
