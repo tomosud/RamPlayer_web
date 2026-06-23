@@ -8,12 +8,21 @@ export interface TimelineState {
   ranges: CacheRange[];
   decodingFrom: number;
   decodingTo: number;
+  thumbnails: TimelineThumbnail[];
+}
+
+export interface TimelineThumbnail {
+  time: number;
+  start: number;
+  end: number;
+  canvas: HTMLCanvasElement;
 }
 
 export interface TimelineCallbacks {
   onSeek(time: number): void;
   onSetIn(time: number): void;
   onSetOut(time: number): void;
+  onHover(time: number | null, clientX: number, clientY: number): void;
 }
 
 const css = (name: string) =>
@@ -31,6 +40,7 @@ export class Timeline {
     ranges: [],
     decodingFrom: 0,
     decodingTo: 0,
+    thumbnails: [],
   };
   private drag: 'in' | 'out' | 'seek' | null = null;
   private readonly handleHitPx = 10;
@@ -47,9 +57,15 @@ export class Timeline {
 
     canvas.addEventListener('pointerdown', this.onDown);
     canvas.addEventListener('pointermove', this.onMove);
+    canvas.addEventListener('pointerleave', this.onLeave);
     canvas.addEventListener('wheel', this.onWheel, { passive: false });
     window.addEventListener('pointerup', this.onUp);
     window.addEventListener('resize', () => this.render(this.state));
+  }
+
+  visibleRange(): { start: number; end: number } {
+    this.ensureView();
+    return { start: this.viewStart, end: this.viewEnd };
   }
 
   private get widthCss(): number {
@@ -89,6 +105,7 @@ export class Timeline {
 
   private onDown = (e: PointerEvent): void => {
     if (this.state.duration <= 0) return;
+    this.callbacks.onHover(null, e.clientX, e.clientY);
     this.canvas.setPointerCapture(e.pointerId);
     const x = this.localX(e.clientX);
     const inX = this.timeToX(this.state.inPoint);
@@ -109,6 +126,7 @@ export class Timeline {
         Math.abs(x - this.timeToX(this.state.inPoint)) <= this.handleHitPx ||
         Math.abs(x - this.timeToX(this.state.outPoint)) <= this.handleHitPx;
       this.canvas.style.cursor = near ? 'ew-resize' : 'pointer';
+      this.callbacks.onHover(this.xToTime(x), e.clientX, e.clientY);
       return;
     }
 
@@ -116,6 +134,10 @@ export class Timeline {
     if (this.drag === 'in') this.callbacks.onSetIn(t);
     else if (this.drag === 'out') this.callbacks.onSetOut(t);
     else this.callbacks.onSeek(t);
+  };
+
+  private onLeave = (e: PointerEvent): void => {
+    if (!this.drag) this.callbacks.onHover(null, e.clientX, e.clientY);
   };
 
   private onUp = (e: PointerEvent): void => {
@@ -165,13 +187,16 @@ export class Timeline {
 
     ctx.fillStyle = css('--panel-2');
     ctx.fillRect(0, 0, wCss, hCss);
+    this.renderThumbnails(ctx, state.thumbnails, wCss, hCss);
 
+    const trackH = Math.max(7, Math.round(hCss * 0.28));
+    const trackY = hCss - trackH;
     ctx.fillStyle = css('--decoded');
     for (const r of state.ranges) {
       const x0 = this.timeToX(r.start);
       const x1 = this.timeToX(r.end);
       if (x1 < 0 || x0 > wCss) continue;
-      ctx.fillRect(Math.max(0, x0), 0, Math.min(wCss, x1) - Math.max(0, x0), hCss);
+      ctx.fillRect(Math.max(0, x0), trackY, Math.min(wCss, x1) - Math.max(0, x0), trackH);
     }
 
     if (state.decodingTo > state.decodingFrom) {
@@ -179,7 +204,7 @@ export class Timeline {
       const x1 = this.timeToX(state.decodingTo);
       if (x1 >= 0 && x0 <= wCss) {
         ctx.fillStyle = css('--decoding');
-        ctx.fillRect(Math.max(0, x0), 0, Math.max(2, Math.min(wCss, x1) - Math.max(0, x0)), hCss);
+        ctx.fillRect(Math.max(0, x0), trackY, Math.max(2, Math.min(wCss, x1) - Math.max(0, x0)), trackH);
       }
     }
 
@@ -207,5 +232,33 @@ export class Timeline {
       ctx.fillStyle = css('--playhead');
       ctx.fillRect(px - 1, 0, 2, hCss);
     }
+  }
+
+  private renderThumbnails(
+    ctx: CanvasRenderingContext2D,
+    thumbnails: TimelineThumbnail[],
+    wCss: number,
+    hCss: number,
+  ): void {
+    ctx.fillStyle = '#050608';
+    ctx.fillRect(0, 0, wCss, hCss);
+    if (thumbnails.length === 0) return;
+
+    const ordered = thumbnails
+      .filter((thumb) => thumb.time >= this.viewStart && thumb.time <= this.viewEnd)
+      .sort((a, b) => a.time - b.time);
+    if (ordered.length === 0) return;
+
+    ctx.save();
+    ctx.globalAlpha = 0.74;
+    for (const current of ordered) {
+      const x0 = Math.max(0, this.timeToX(current.start));
+      const x1 = Math.min(wCss, this.timeToX(current.end));
+      const width = Math.max(1, x1 - x0);
+      ctx.drawImage(current.canvas, x0, 0, width, hCss);
+    }
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
+    ctx.fillRect(0, 0, wCss, hCss);
+    ctx.restore();
   }
 }

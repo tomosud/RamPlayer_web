@@ -31,6 +31,8 @@ export interface RestoreState {
   lastTime?: number;
   inPoint?: number;
   outPoint?: number;
+  inPointSet?: boolean;
+  outPointSet?: boolean;
   loop?: boolean;
 }
 
@@ -56,6 +58,8 @@ export class Player {
   private ctx2d: CanvasRenderingContext2D;
   private input: Input | null = null;
   private videoSink: CanvasSink | null = null;
+  private thumbnailSink: CanvasSink | null = null;
+  private thumbnailUnavailable = false;
   private audioSink: AudioBufferSink | null = null;
   private audioContext: AudioContext | null = null;
   private gainNode: GainNode | null = null;
@@ -77,7 +81,7 @@ export class Player {
   fps = 30;
   frameDuration = 1 / 30;
   playing = false;
-  loop = false;
+  loop = true;
   inPoint = 0;
   outPoint = 0;
   fileName = '';
@@ -86,6 +90,8 @@ export class Player {
   private pendingSeekTime: number | null = null;
   private pendingStepDelta = 0;
   private stepQueueRunning = false;
+  private inPointSet = false;
+  private outPointSet = false;
   private volume = 1;
   private stepGen = 0;
   private stepDecoding = false;
@@ -145,6 +151,7 @@ export class Player {
   async load(file: File, restore?: RestoreState): Promise<void> {
     await this.dispose();
     this.fileName = file.name;
+    this.thumbnailUnavailable = false;
 
     const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
     this.input = input;
@@ -179,6 +186,13 @@ export class Player {
         fit: 'contain',
         alpha: videoCanBeTransparent,
       });
+      this.thumbnailSink = new CanvasSink(videoTrack, {
+        poolSize: 1,
+        width: 180,
+        height: 102,
+        fit: 'cover',
+        alpha: videoCanBeTransparent,
+      });
       this.canvas.width = await videoTrack.getDisplayWidth();
       this.canvas.height = await videoTrack.getDisplayHeight();
       try {
@@ -191,6 +205,7 @@ export class Player {
       this.canvas.width = 1;
       this.canvas.height = 1;
       this.videoSink = null;
+      this.thumbnailSink = null;
     }
     this.frameDuration = 1 / this.fps;
 
@@ -213,7 +228,9 @@ export class Player {
     this.inPoint = clamp(restore?.inPoint ?? 0, 0, this.duration);
     this.outPoint = clamp(restore?.outPoint ?? this.duration, this.inPoint, this.duration);
     if (this.outPoint <= this.inPoint + this.eps) this.outPoint = this.duration;
-    this.loop = restore?.loop ?? false;
+    this.inPointSet = restore?.inPointSet ?? this.inPoint > this.eps;
+    this.outPointSet = restore?.outPointSet ?? this.outPoint < this.duration - this.eps;
+    this.loop = restore?.loop ?? true;
     this.currentTime = clamp(restore?.lastTime ?? 0, 0, this.duration);
     this.currentTime = this.clampToPlaybackRange(this.currentTime);
     this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
@@ -254,7 +271,9 @@ export class Player {
     this.stepDecoding = false;
 
     this.currentTime = this.clampToPlaybackRange(this.currentTime);
-    if (this.currentTime >= this.outPoint - this.eps) this.currentTime = this.inPoint;
+    if (this.currentTime < this.playbackStart || this.currentTime >= this.playbackEnd - this.eps) {
+      this.currentTime = this.playbackStart;
+    }
     this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
 
     if (this.audioContext.state === 'suspended') {
@@ -270,7 +289,7 @@ export class Player {
 
     if (this.audioSink) {
       void this.audioIterator?.return(undefined);
-      this.audioIterator = this.audioSink.buffers(this.playbackMediaAtStart, this.toMediaTime(this.outPoint));
+      this.audioIterator = this.audioSink.buffers(this.playbackMediaAtStart, this.toMediaTime(this.playbackEnd));
       void this.runAudioIterator(this.asyncId);
     }
 
@@ -297,12 +316,12 @@ export class Player {
     if (!this.playing) return;
 
     const t = this.getPlaybackTime();
-    if (t >= this.outPoint - 1e-4) {
+    if (t >= this.playbackEnd - 1e-4) {
       if (this.loop) {
-        void this.seek(this.inPoint, true);
+        void this.seek(this.playbackStart, true);
       } else {
         this.stopPlaybackSideEffects();
-        this.currentTime = this.outPoint;
+        this.currentTime = this.playbackEnd;
         this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
         this.callbacks.onState(false);
         this.callbacks.onTime(this.currentTime);
@@ -310,7 +329,7 @@ export class Player {
       return;
     }
 
-    this.currentTime = t < this.inPoint ? this.inPoint : t;
+    this.currentTime = t < this.playbackStart ? this.playbackStart : t;
     this.renderDueFrames();
     this.callbacks.onTime(this.currentTime);
     this.raf = requestAnimationFrame(this.tick);
@@ -391,7 +410,7 @@ export class Player {
       this.seekRunning = false;
     }
 
-    if (shouldPlay && this.currentTime < this.outPoint - this.eps) await this.play();
+    if (shouldPlay && this.currentTime < this.playbackEnd - this.eps) await this.play();
     else await this.enterStepMode(this.currentTime);
   }
 
@@ -436,14 +455,37 @@ export class Player {
   }
 
   private async stepOnce(dir: 1 | -1): Promise<boolean> {
-    if (dir > 0 && this.currentTime >= this.outPoint - this.eps) return false;
-    if (dir < 0 && this.currentTime <= this.inPoint + this.eps) {
-      await this.drawAt(this.inPoint);
-      this.currentTime = this.inPoint;
+    if (dir > 0 && this.currentTime >= this.playbackEnd - this.eps) {
+      if (!this.hasPlaybackRange) return false;
+      await this.drawAt(this.playbackStart);
+      this.currentTime = this.playbackStart;
       this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
       this.callbacks.onTime(this.currentTime);
       this.scheduleStepPrefetch(this.currentTime);
-      return false;
+      return true;
+    }
+    if (dir < 0 && this.currentTime <= this.playbackStart + this.eps) {
+      if (!this.hasPlaybackRange) {
+        await this.drawAt(this.playbackStart);
+        this.currentTime = this.playbackStart;
+        this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
+        this.callbacks.onTime(this.currentTime);
+        this.scheduleStepPrefetch(this.currentTime);
+        return false;
+      }
+      await this.ensureStepFrame(this.playbackEnd, -1);
+      const frame = this.prevCachedFrame(this.playbackEnd);
+      if (frame && frame.time >= this.playbackStart - this.eps) {
+        this.blitStepFrame(frame);
+        this.currentTime = this.clampToPlaybackRange(frame.time);
+      } else {
+        await this.drawAt(this.playbackEnd);
+        this.currentTime = this.playbackEnd;
+      }
+      this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
+      this.callbacks.onTime(this.currentTime);
+      this.scheduleStepPrefetch(this.currentTime);
+      return true;
     }
 
     let frame = dir > 0 ? this.nextCachedFrame(this.currentTime) : this.prevCachedFrame(this.currentTime);
@@ -492,8 +534,8 @@ export class Player {
 
     const c = this.clampToPlaybackRange(center);
     const span = Math.max(this.frameDuration * (this.immediateRadius + 2), 0.25);
-    const from = dir > 0 ? c : Math.max(this.inPoint, c - span);
-    const to = dir > 0 ? Math.min(this.outPoint, c + span) : c;
+    const from = dir > 0 ? c : Math.max(this.playbackStart, c - span);
+    const to = dir > 0 ? Math.min(this.playbackEnd, c + span) : c;
 
     this.stepDecodingFrom = Math.min(from, to);
     this.stepDecodingTo = Math.max(from, to);
@@ -530,8 +572,8 @@ export class Player {
     const clampedCenter = this.clampToPlaybackRange(center);
     const targetRadius = full ? this.stepRadius : this.immediateRadius;
     const span = Math.max(this.frameDuration * targetRadius, 0.5);
-    const wantFrom = Math.max(this.inPoint, clampedCenter - span);
-    const wantTo = Math.min(this.outPoint, clampedCenter + span);
+    const wantFrom = Math.max(this.playbackStart, clampedCenter - span);
+    const wantTo = Math.min(this.playbackEnd, clampedCenter + span);
     this.stepDecodingFrom = clampedCenter;
     this.stepDecodingTo = clampedCenter;
     try {
@@ -548,8 +590,8 @@ export class Player {
   }
 
   private async decodeRangeInChunks(gen: number, from: number, to: number, dir: 1 | -1): Promise<void> {
-    from = Math.max(this.inPoint, from);
-    to = Math.min(this.outPoint, to);
+    from = Math.max(this.playbackStart, from);
+    to = Math.min(this.playbackEnd, to);
     if (to - from <= this.frameDuration * 0.5) return;
 
     if (dir > 0) {
@@ -574,8 +616,8 @@ export class Player {
    */
   private async decodeRange(gen: number, from: number, to: number): Promise<void> {
     if (!this.videoSink) return;
-    from = Math.max(this.inPoint, from);
-    to = Math.min(this.outPoint, to);
+    from = Math.max(this.playbackStart, from);
+    to = Math.min(this.playbackEnd, to);
     if (to - from <= this.frameDuration * 0.5) return;
 
     this.stepDecodingFrom = Math.min(this.stepDecodingFrom, from);
@@ -746,7 +788,7 @@ export class Player {
     this.videoIterator = null;
     if (!this.videoSink) return;
 
-    this.videoIterator = this.videoSink.canvases(this.toMediaTime(this.currentTime), this.toMediaTime(this.outPoint));
+    this.videoIterator = this.videoSink.canvases(this.toMediaTime(this.currentTime), this.toMediaTime(this.playbackEnd));
     const first = (await this.videoIterator.next()).value ?? null;
     const second = (await this.videoIterator.next()).value ?? null;
     if (id !== this.asyncId) return;
@@ -766,6 +808,31 @@ export class Player {
     if (!this.videoSink) return;
     const frame = await this.videoSink.getCanvas(this.toMediaTime(time));
     if (frame) this.blitStepFrame(this.storeWrappedCanvas(frame));
+  }
+
+  async thumbnailAt(time: number, width: number, height: number): Promise<HTMLCanvasElement | null> {
+    if (!this.thumbnailSink || this.thumbnailUnavailable || this.playing) return null;
+    try {
+      const frame = await this.thumbnailSink.getCanvas(this.toMediaTime(this.clampToPlaybackRange(time)));
+      if (!frame) return null;
+
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(width));
+      canvas.height = Math.max(1, Math.round(height));
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return null;
+
+      const scale = Math.max(canvas.width / frame.canvas.width, canvas.height / frame.canvas.height);
+      const sw = canvas.width / scale;
+      const sh = canvas.height / scale;
+      const sx = Math.max(0, (frame.canvas.width - sw) / 2);
+      const sy = Math.max(0, (frame.canvas.height - sh) / 2);
+      ctx.drawImage(frame.canvas, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+      return canvas;
+    } catch {
+      this.thumbnailUnavailable = true;
+      return null;
+    }
   }
 
   private blit(frame: WrappedCanvas): void {
@@ -822,13 +889,25 @@ export class Player {
 
   private clampToPlaybackRange(time: number): number {
     const t = clamp(time, 0, this.duration);
-    if (t < this.inPoint) return this.inPoint;
-    if (t > this.outPoint) return this.outPoint;
+    if (t < this.playbackStart) return this.playbackStart;
+    if (t > this.playbackEnd) return this.playbackEnd;
     return t;
   }
 
   private get eps(): number {
     return Math.max(this.frameDuration, 1e-3);
+  }
+
+  private get hasPlaybackRange(): boolean {
+    return this.inPointSet && this.outPointSet && this.outPoint > this.inPoint + this.eps;
+  }
+
+  private get playbackStart(): number {
+    return this.hasPlaybackRange ? this.inPoint : 0;
+  }
+
+  private get playbackEnd(): number {
+    return this.hasPlaybackRange ? this.outPoint : this.duration;
   }
 
   private frameKey(time: number): number {
@@ -837,19 +916,23 @@ export class Player {
 
   setIn(time: number = this.currentTime): void {
     this.inPoint = clamp(time, 0, Math.max(0, this.outPoint - this.eps));
-    if (this.currentTime < this.inPoint) void this.seek(this.inPoint);
+    this.inPointSet = true;
+    if (this.hasPlaybackRange && this.currentTime < this.inPoint) void this.seek(this.inPoint);
     this.callbacks.onInOut(this.inPoint, this.outPoint, this.loop);
   }
 
   setOut(time: number = this.currentTime): void {
     this.outPoint = clamp(time, this.inPoint + this.eps, this.duration);
-    if (this.currentTime > this.outPoint) void this.seek(this.outPoint);
+    this.outPointSet = true;
+    if (this.hasPlaybackRange && this.currentTime > this.outPoint) void this.seek(this.outPoint);
     this.callbacks.onInOut(this.inPoint, this.outPoint, this.loop);
   }
 
   clearInOut(): void {
     this.inPoint = 0;
     this.outPoint = this.duration;
+    this.inPointSet = false;
+    this.outPointSet = false;
     this.callbacks.onInOut(this.inPoint, this.outPoint, this.loop);
   }
 
@@ -942,6 +1025,8 @@ export class Player {
       lastTime: this.currentTime,
       inPoint: this.inPoint,
       outPoint: this.outPoint,
+      inPointSet: this.inPointSet,
+      outPointSet: this.outPointSet,
       loop: this.loop,
     };
   }
@@ -961,6 +1046,7 @@ export class Player {
     }
     this.audioSink = null;
     this.videoSink = null;
+    this.thumbnailSink = null;
     this.stepFrames.clear();
     this.stepKeys = [];
     this.stepDecoding = false;

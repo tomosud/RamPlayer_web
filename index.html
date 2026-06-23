@@ -22,48 +22,79 @@
       </div>
 
       <div id="error" class="error" hidden></div>
-
-      <div class="timeline-wrap">
-        <canvas id="timeline" class="timeline"></canvas>
+      <div id="timelinePreview" class="timeline-preview" hidden>
+        <canvas id="timelinePreviewCanvas"></canvas>
+        <span id="timelinePreviewTime">00:00.000</span>
       </div>
 
-      <div class="filmstrip-wrap">
-        <canvas id="filmstrip" class="filmstrip"></canvas>
-      </div>
+      <button id="showUiBtn" class="show-ui-btn" hidden>Controls ▲</button>
 
-      <div class="time-row">
-        <span id="curTime">00:00.000</span>
-        <span class="sep">/</span>
-        <span id="totalTime">00:00.000</span>
-        <span id="inOutLabel" class="inout-label"></span>
-        <span id="memUsage" class="mem-usage"></span>
-      </div>
+      <section id="floatingUi" class="floating-ui" aria-label="Player controls">
+        <div class="timeline-wrap">
+          <canvas id="timeline" class="timeline"></canvas>
+        </div>
 
-      <div class="controls">
-        <button id="prevFrame" title="Previous frame (Left)">Prev</button>
-        <button id="playPause" title="Play / Pause (Space)">Play</button>
-        <button id="nextFrame" title="Next frame (Right)">Next</button>
+        <div class="filmstrip-wrap">
+          <canvas id="filmstrip" class="filmstrip"></canvas>
+        </div>
 
-        <span class="spacer"></span>
+        <div class="info-row">
+          <div class="time-cluster">
+            <span id="curTime">00:00.000</span>
+            <span class="sep">/</span>
+            <span id="totalTime">00:00.000</span>
+            <span id="timecodeLabel" class="metric">TC 00:00:00:00</span>
+            <span id="frameLabel" class="metric">Frame 0 / 0</span>
+            <span id="inOutLabel" class="inout-label"></span>
+          </div>
+          <span id="mediaInfo" class="media-info"></span>
+          <span id="memUsage" class="mem-usage"></span>
+        </div>
 
-        <button id="setIn" title="Set In at current time (I)">Set In</button>
-        <button id="setOut" title="Set Out at current time (O)">Set Out</button>
-        <button id="clearInOut" title="Clear In/Out">Clear In/Out</button>
-        <button id="loopBtn" title="Loop on/off (L)">Loop: OFF</button>
+        <div class="controls">
+          <button id="prevFrame" title="Previous frame (Left)">Prev</button>
+          <button id="playPause" title="Play / Pause (Space)">Play</button>
+          <button id="nextFrame" title="Next frame (Right)">Next</button>
 
-        <span class="spacer"></span>
+          <span class="spacer"></span>
 
-        <label class="vol">
-          Volume <input id="volume" type="range" min="0" max="1" step="0.01" value="1" />
-        </label>
-      </div>
+          <button id="setIn" title="Set In at current time (I)">Set In</button>
+          <button id="setOut" title="Set Out at current time (O)">Set Out</button>
+          <button id="clearInOut" title="Clear In/Out">Clear In/Out</button>
+          <button id="loopBtn" title="Loop on/off (L)">Loop: OFF</button>
 
-      <div class="legend">
-        <span><i class="sw sw-decoded"></i>Decoded step cache</span>
-        <span><i class="sw sw-decoding"></i>Decoding</span>
-        <span><i class="sw sw-inout"></i>In / Out</span>
-        <span><i class="sw sw-playhead"></i>Playhead</span>
-      </div>
+          <span class="spacer"></span>
+
+          <label class="zoom-select">
+            Scale
+            <select id="viewScale">
+              <option value="fit">Fit</option>
+              <option value="0.1">10%</option>
+              <option value="0.25">25%</option>
+              <option value="0.5">50%</option>
+              <option value="1">100%</option>
+              <option value="custom" disabled>Custom</option>
+            </select>
+          </label>
+          <button id="viewFitBtn" title="Fit video to screen (F)">Fit</button>
+          <button id="resetViewBtn" title="Reset video view">Default</button>
+
+          <span class="spacer"></span>
+
+          <label class="vol">
+            Volume <input id="volume" type="range" min="0" max="1" step="0.01" value="1" />
+          </label>
+        </div>
+
+        <div class="legend">
+          <span><i class="sw sw-decoded"></i>Decoded step cache</span>
+          <span><i class="sw sw-decoding"></i>Decoding</span>
+          <span><i class="sw sw-inout"></i>In / Out</span>
+          <span><i class="sw sw-playhead"></i>Playhead</span>
+        </div>
+
+        <button id="closeUiBtn" class="collapse-ui-btn" title="Hide controls" aria-label="Hide controls">▼</button>
+      </section>
     </div>
 
     <script type="module" src="/src/main.ts"></script>

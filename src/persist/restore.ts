@@ -15,6 +15,8 @@ export interface PersistedSettings {
   lastTime: number;
   inPoint: number;
   outPoint: number;
+  inPointSet?: boolean;
+  outPointSet?: boolean;
   loop: boolean;
 }
 
