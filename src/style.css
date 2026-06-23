@@ -283,7 +283,7 @@ button.active {
 
 .timeline {
   width: 100%;
-  height: 26px;
+  height: 34px;
   display: block;
   background: var(--panel-solid);
   border: 1px solid var(--border);
