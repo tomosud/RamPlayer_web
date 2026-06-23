@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "description": "Local video RAM player (Mediabunny + WebCodecs + Canvas 2D), static / GitHub Pages.",
+  "license": "MIT",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
