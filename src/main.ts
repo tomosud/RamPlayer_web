@@ -385,10 +385,20 @@ function setControlsEnabled(on: boolean): void {
   for (const b of controlButtons) b.disabled = !on;
 }
 
-function isEditableTarget(target: EventTarget | null): boolean {
+function isShortcutInputTarget(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null;
   if (!el) return false;
-  return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.tagName === 'BUTTON';
+  return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT';
+}
+
+function isInteractiveTarget(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el) return false;
+  return isShortcutInputTarget(el) || el.tagName === 'BUTTON';
+}
+
+function blurControl(el: HTMLElement): void {
+  requestAnimationFrame(() => el.blur());
 }
 
 function fitScale(): number {
@@ -535,6 +545,11 @@ function renderFilmstrip(frames: StepFrame[], currentTime: number): void {
 
 setControlsEnabled(false);
 
+floatingUi.addEventListener('click', (e) => {
+  const button = (e.target as HTMLElement | null)?.closest('button');
+  if (button) blurControl(button);
+});
+
 const player = new Player(canvas, {
   onLoaded(i) {
     info = i;
@@ -665,7 +680,7 @@ stage.addEventListener('wheel', (e) => {
 
 stage.addEventListener('pointerdown', (e) => {
   if (!player.loaded || e.button !== 0) return;
-  if (isEditableTarget(e.target)) return;
+  if (isInteractiveTarget(e.target)) return;
   stageDrag = { pointerId: e.pointerId, x: e.clientX, y: e.clientY };
   stage.setPointerCapture(e.pointerId);
   stage.classList.add('is-panning');
@@ -719,7 +734,7 @@ async function onDrop(e: DragEvent): Promise<void> {
 
 window.addEventListener('keydown', (e) => {
   if (!player.loaded) return;
-  if (isEditableTarget(e.target)) return;
+  if (isShortcutInputTarget(e.target)) return;
 
   switch (e.key) {
     case ' ':
@@ -805,13 +820,17 @@ closeUiBtn.addEventListener('click', () => {
   showUiBtn.hidden = false;
 });
 showUiBtn.addEventListener('click', () => {
+  blurControl(showUiBtn);
   topbar.hidden = false;
   app.classList.remove('chrome-hidden');
   floatingUi.hidden = false;
   showUiBtn.hidden = true;
 });
 
-resumeBtn.addEventListener('click', () => void onResume());
+resumeBtn.addEventListener('click', () => {
+  blurControl(resumeBtn);
+  void onResume();
+});
 
 async function onResume(): Promise<void> {
   if (!pendingRestore?.handle) return;
