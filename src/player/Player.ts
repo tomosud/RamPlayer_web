@@ -84,7 +84,8 @@ export class Player {
 
   private seekRunning = false;
   private pendingSeekTime: number | null = null;
-  private stepping = false;
+  private pendingStepDelta = 0;
+  private stepQueueRunning = false;
   private volume = 1;
   private stepGen = 0;
   private stepDecoding = false;
@@ -94,8 +95,9 @@ export class Player {
   private stepKeys: number[] = [];
   /** UI フィルムストリップ表示用の固定半径（中央±10 = 21スロット）。キャッシュ容量とは独立。 */
   private readonly filmstripRadius = 10;
-  /** ensureStepWindow が即時に満たすべき前後フレーム数（応答性優先の小窓）。 */
+  /** 次フレームが欠けたときに即時確保する前後フレーム数（応答性優先の小窓）。 */
   private readonly immediateRadius = 12;
+  private readonly refillThresholdRatio = 0.5;
   /** 1フレームの推定バイト数（表示幅×高さ×RGBA 4byte）。load() で確定。 */
   private bytesPerFrame = 1280 * 720 * 4;
   /** 再生中のフレームキャッシュ予算（控えめ。再生デコードと併存するため）。 */
@@ -117,6 +119,14 @@ export class Player {
   private get stepRadius(): number {
     if (this.playing) return this.immediateRadius;
     return Math.max(this.immediateRadius, Math.floor(this.maxStepFrames / 2) - 2);
+  }
+
+  private get refillThresholdFrames(): number {
+    return Math.max(this.immediateRadius * 2, Math.floor(this.stepRadius * this.refillThresholdRatio));
+  }
+
+  private get prefetchChunkSec(): number {
+    return Math.max(this.frameDuration * 24, 0.35);
   }
 
   constructor(
@@ -386,48 +396,72 @@ export class Player {
   }
 
   async stepForward(): Promise<void> {
-    if (!this.videoSink || this.stepping) return;
-    this.stepping = true;
-    this.stopPlaybackSideEffects(true);
-    try {
-      await this.ensureStepWindow(this.currentTime);
-      const frame = this.nextCachedFrame(this.currentTime);
-      if (frame) {
-        this.blitStepFrame(frame);
-        this.currentTime = this.clampToPlaybackRange(frame.time);
-        this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
-        this.callbacks.onTime(this.currentTime);
-        if (this.framesAhead(this.currentTime) < this.immediateRadius) void this.prefetchStepWindow(this.currentTime);
-      }
-    } finally {
-      this.stepping = false;
-    }
+    this.queueStep(1);
   }
 
   async stepBackward(): Promise<void> {
-    if (!this.videoSink || this.stepping) return;
-    this.stepping = true;
+    this.queueStep(-1);
+  }
+
+  private queueStep(dir: 1 | -1): void {
+    if (!this.videoSink) return;
+    this.pendingStepDelta += dir;
+    if (!this.stepQueueRunning) void this.drainStepQueue();
+  }
+
+  private async drainStepQueue(): Promise<void> {
+    if (!this.videoSink || this.stepQueueRunning) return;
+    this.stepQueueRunning = true;
     this.stopPlaybackSideEffects(true);
     try {
-      await this.ensureStepWindow(this.currentTime);
-      const frame = this.prevCachedFrame(this.currentTime);
-      if (!frame && this.currentTime <= this.inPoint + this.eps) {
-        await this.drawAt(this.inPoint);
-        this.currentTime = this.inPoint;
-        this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
-        this.callbacks.onTime(this.currentTime);
-        return;
-      }
-      if (frame) {
-        this.blitStepFrame(frame);
-        this.currentTime = this.clampToPlaybackRange(frame.time);
-        this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
-        this.callbacks.onTime(this.currentTime);
-        if (this.framesBehind(this.currentTime) < this.immediateRadius) void this.prefetchStepWindow(this.currentTime);
+      let stepsSinceYield = 0;
+      while (this.pendingStepDelta !== 0) {
+        const dir = this.pendingStepDelta > 0 ? 1 : -1;
+        this.pendingStepDelta -= dir;
+        const moved = await this.stepOnce(dir);
+        if (!moved) {
+          this.pendingStepDelta = 0;
+          break;
+        }
+        stepsSinceYield++;
+        if (stepsSinceYield >= 4) {
+          stepsSinceYield = 0;
+          await delay(0);
+        }
       }
     } finally {
-      this.stepping = false;
+      this.stepQueueRunning = false;
+      if (this.pendingStepDelta !== 0) void this.drainStepQueue();
     }
+  }
+
+  private async stepOnce(dir: 1 | -1): Promise<boolean> {
+    if (dir > 0 && this.currentTime >= this.outPoint - this.eps) return false;
+    if (dir < 0 && this.currentTime <= this.inPoint + this.eps) {
+      await this.drawAt(this.inPoint);
+      this.currentTime = this.inPoint;
+      this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
+      this.callbacks.onTime(this.currentTime);
+      this.scheduleStepPrefetch(this.currentTime);
+      return false;
+    }
+
+    let frame = dir > 0 ? this.nextCachedFrame(this.currentTime) : this.prevCachedFrame(this.currentTime);
+    if (!frame) {
+      await this.ensureStepFrame(this.currentTime, dir);
+      frame = dir > 0 ? this.nextCachedFrame(this.currentTime) : this.prevCachedFrame(this.currentTime);
+    }
+    if (!frame) {
+      this.scheduleStepPrefetch(this.currentTime);
+      return false;
+    }
+
+    this.blitStepFrame(frame);
+    this.currentTime = this.clampToPlaybackRange(frame.time);
+    this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
+    this.callbacks.onTime(this.currentTime);
+    this.scheduleStepPrefetch(this.currentTime);
+    return true;
   }
 
   private async enterStepMode(center: number): Promise<void> {
@@ -448,12 +482,35 @@ export class Player {
     void this.prefetchStepWindow(this.currentTime);
   }
 
-  private async ensureStepWindow(center: number): Promise<void> {
-    if (this.framesBehind(center) >= this.immediateRadius && this.framesAhead(center) >= this.immediateRadius) {
-      return;
+  private async ensureStepFrame(center: number, dir: 1 | -1): Promise<void> {
+    if (dir > 0 && this.contiguousFramesAhead(center) > 0) return;
+    if (dir < 0 && this.contiguousFramesBehind(center) > 0) return;
+
+    const gen = ++this.stepGen;
+    await this.stopVideoIterator();
+    this.stepDecoding = true;
+
+    const c = this.clampToPlaybackRange(center);
+    const span = Math.max(this.frameDuration * (this.immediateRadius + 2), 0.25);
+    const from = dir > 0 ? c : Math.max(this.inPoint, c - span);
+    const to = dir > 0 ? Math.min(this.outPoint, c + span) : c;
+
+    this.stepDecodingFrom = Math.min(from, to);
+    this.stepDecodingTo = Math.max(from, to);
+    try {
+      await this.decodeRange(gen, from, to);
+    } finally {
+      if (gen === this.stepGen) this.stepDecoding = false;
     }
-    // まず応答性優先の小窓だけを確実に確保する（広い先読みは別途バックグラウンドで行う）。
-    await this.prefetchStepWindow(center, false);
+  }
+
+  private scheduleStepPrefetch(center: number): void {
+    if (!this.videoSink || this.playing) return;
+    if (this.stepDecoding) return;
+    const ahead = this.contiguousFramesAhead(center);
+    const behind = this.contiguousFramesBehind(center);
+    if (ahead >= this.refillThresholdFrames && behind >= this.refillThresholdFrames) return;
+    void this.prefetchStepWindow(center);
   }
 
   /**
@@ -472,7 +529,7 @@ export class Player {
 
     const clampedCenter = this.clampToPlaybackRange(center);
     const targetRadius = full ? this.stepRadius : this.immediateRadius;
-    const span = Math.max(this.frameDuration * (targetRadius + 6), 0.5);
+    const span = Math.max(this.frameDuration * targetRadius, 0.5);
     const wantFrom = Math.max(this.inPoint, clampedCenter - span);
     const wantTo = Math.min(this.outPoint, clampedCenter + span);
     this.stepDecodingFrom = clampedCenter;
@@ -482,11 +539,31 @@ export class Player {
       const aheadEdge = this.contiguousAheadEdge(clampedCenter);
       const behindEdge = this.contiguousBehindEdge(clampedCenter);
       // 前方の不足分 → 後方の不足分の順にデコード。
-      await this.decodeRange(gen, aheadEdge, wantTo);
+      await this.decodeRangeInChunks(gen, aheadEdge, wantTo, 1);
       if (gen !== this.stepGen) return;
-      await this.decodeRange(gen, wantFrom, behindEdge);
+      await this.decodeRangeInChunks(gen, wantFrom, behindEdge, -1);
     } finally {
       if (gen === this.stepGen) this.stepDecoding = false;
+    }
+  }
+
+  private async decodeRangeInChunks(gen: number, from: number, to: number, dir: 1 | -1): Promise<void> {
+    from = Math.max(this.inPoint, from);
+    to = Math.min(this.outPoint, to);
+    if (to - from <= this.frameDuration * 0.5) return;
+
+    if (dir > 0) {
+      for (let start = from; start < to && gen === this.stepGen; start += this.prefetchChunkSec) {
+        await this.decodeRange(gen, start, Math.min(to, start + this.prefetchChunkSec));
+        await delay(0);
+      }
+      return;
+    }
+
+    for (let end = to; end > from && gen === this.stepGen; end -= this.prefetchChunkSec) {
+      const start = Math.max(from, end - this.prefetchChunkSec);
+      await this.decodeRange(gen, start, end);
+      await delay(0);
     }
   }
 
@@ -550,6 +627,19 @@ export class Player {
     return t;
   }
 
+  private contiguousFramesAhead(center: number): number {
+    const gap = Math.max(this.frameDuration * 1.8, 0.08);
+    let t = center;
+    let count = 0;
+    for (;;) {
+      const f = this.nextCachedFrame(t);
+      if (!f || f.time - t > gap) break;
+      t = f.time;
+      count++;
+    }
+    return count;
+  }
+
   /** center を含むキャッシュ済み連続区間の下端時刻（無ければ center）。 */
   private contiguousBehindEdge(center: number): number {
     const gap = Math.max(this.frameDuration * 1.8, 0.08);
@@ -560,6 +650,19 @@ export class Player {
       t = f.time;
     }
     return t;
+  }
+
+  private contiguousFramesBehind(center: number): number {
+    const gap = Math.max(this.frameDuration * 1.8, 0.08);
+    let t = center;
+    let count = 0;
+    for (;;) {
+      const f = this.prevCachedFrame(t);
+      if (!f || t - f.time > gap) break;
+      t = f.time;
+      count++;
+    }
+    return count;
   }
 
   private storeWrappedCanvas(frame: WrappedCanvas): StepFrame {
@@ -633,14 +736,6 @@ export class Player {
       }
     }
     return best;
-  }
-
-  private framesAhead(time: number): number {
-    return this.stepKeys.filter((k) => this.stepFrames.get(k)!.time > time + 1e-6).length;
-  }
-
-  private framesBehind(time: number): number {
-    return this.stepKeys.filter((k) => this.stepFrames.get(k)!.time < time - 1e-6).length;
   }
 
   private async startVideoIterator(drawFirst = false): Promise<void> {
