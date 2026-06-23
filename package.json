@@ -1,0 +1,19 @@
+{
+  "name": "ramplayer-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Local video RAM player (Mediabunny + WebCodecs + Canvas 2D), static / GitHub Pages.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "mediabunny": "^1.49.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0"
+  }
+}

@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>動画RAMプレイヤー</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <h1>動画RAMプレイヤー</h1>
+        <div id="filename" class="filename">ファイル未選択</div>
+      </header>
+
+      <!-- 動画表示 + ドロップエリア -->
+      <div id="stage" class="stage">
+        <canvas id="canvas"></canvas>
+        <div id="dropHint" class="drop-hint">
+          <p>ここに動画ファイルをドラッグ＆ドロップ</p>
+          <p class="sub">MP4 / MOV / WebM（WebCodecs対応コーデック）</p>
+        </div>
+        <button id="resumeBtn" class="resume-btn" hidden>前回の動画を再開</button>
+      </div>
+
+      <!-- エラー表示 -->
+      <div id="error" class="error" hidden></div>
+
+      <!-- タイムライン -->
+      <div class="timeline-wrap">
+        <canvas id="timeline" class="timeline"></canvas>
+      </div>
+
+      <!-- 時刻表示 -->
+      <div class="time-row">
+        <span id="curTime">00:00.000</span>
+        <span class="sep">/</span>
+        <span id="totalTime">00:00.000</span>
+        <span id="inOutLabel" class="inout-label"></span>
+      </div>
+
+      <!-- コントロール -->
+      <div class="controls">
+        <button id="prevFrame" title="前の1フレーム (←)">⏮ コマ戻し</button>
+        <button id="playPause" title="再生 / 一時停止 (Space)">▶ 再生</button>
+        <button id="nextFrame" title="次の1フレーム (→)">コマ送り ⏭</button>
+
+        <span class="spacer"></span>
+
+        <button id="setIn" title="In点を現在位置に (I)">In設定</button>
+        <button id="setOut" title="Out点を現在位置に (O)">Out設定</button>
+        <button id="clearInOut" title="In/Out解除">In/Out解除</button>
+        <button id="loopBtn" title="ループ ON/OFF (L)">ループ: OFF</button>
+
+        <span class="spacer"></span>
+
+        <label class="vol">
+          音量 <input id="volume" type="range" min="0" max="1" step="0.01" value="1" />
+        </label>
+      </div>
+
+      <!-- 凡例 -->
+      <div class="legend">
+        <span><i class="sw sw-decoded"></i>デコード済みフレーム範囲</span>
+        <span><i class="sw sw-decoding"></i>デコード中</span>
+        <span><i class="sw sw-inout"></i>In / Out 範囲</span>
+        <span><i class="sw sw-playhead"></i>再生位置</span>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
