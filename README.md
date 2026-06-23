@@ -1,5 +1,7 @@
 # 動画RAMプレイヤー (RamPlayer_web)
 
+https://tomosud.github.io/RamPlayer_web/
+
 ローカルの動画ファイルをブラウザ内だけで再生・コマ送り・範囲ループできる、サーバー不要の静的Webアプリです。
 **Mediabunny + WebCodecs + Canvas 2D** を使い、動画全体をメモリへ展開せず、現在位置の前後フレームだけをデコードしてキャッシュします。
 
