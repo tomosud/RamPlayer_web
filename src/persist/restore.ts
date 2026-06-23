@@ -9,6 +9,9 @@
 
 export interface PersistedSettings {
   name: string;
+  size?: number;
+  lastModified?: number;
+  duration?: number;
   lastTime: number;
   inPoint: number;
   outPoint: number;

@@ -2,17 +2,16 @@ import './style.css';
 import { Player, type LoadedInfo, type RestoreState } from './player/Player';
 import { Timeline } from './ui/Timeline';
 import {
-  getHandleFromDrop,
-  savePersisted,
-  loadPersisted,
   clearPersisted,
+  fileFromHandle,
+  getHandleFromDrop,
+  loadPersisted,
   queryReadPermission,
   requestReadPermission,
-  fileFromHandle,
+  savePersisted,
   type PersistedRecord,
 } from './persist/restore';
 
-// ---- DOM ----------------------------------------------------------------
 const $ = <T extends HTMLElement>(id: string): T => {
   const el = document.getElementById(id);
   if (!el) throw new Error(`#${id} not found`);
@@ -49,8 +48,8 @@ const controlButtons = [
   loopBtn,
 ];
 
-// ---- 状態 ---------------------------------------------------------------
 let currentHandle: FileSystemFileHandle | null = null;
+let currentFile: File | null = null;
 let pendingRestore: PersistedRecord | undefined;
 let info: LoadedInfo | null = null;
 
@@ -63,26 +62,35 @@ function fmt(t: number): string {
 }
 
 function showError(msg: string | null): void {
-  if (msg) {
-    errorBox.textContent = msg;
-    errorBox.hidden = false;
-  } else {
-    errorBox.hidden = true;
-  }
+  errorBox.textContent = msg ?? '';
+  errorBox.hidden = !msg;
 }
 
 function setControlsEnabled(on: boolean): void {
   for (const b of controlButtons) b.disabled = !on;
 }
+
+function restoreForFile(file: File): RestoreState | undefined {
+  const s = pendingRestore?.settings;
+  if (!s) return undefined;
+  if (s.name !== file.name) return undefined;
+  if (s.size !== file.size || s.lastModified !== file.lastModified) return undefined;
+  return {
+    lastTime: s.lastTime,
+    inPoint: s.inPoint,
+    outPoint: s.outPoint,
+    loop: s.loop,
+  };
+}
+
 setControlsEnabled(false);
 
-// ---- Player / Timeline --------------------------------------------------
 const player = new Player(canvas, {
   onLoaded(i) {
     info = i;
-    filenameEl.textContent = `${i.name}  （${i.width}×${i.height} / ${i.fps.toFixed(2)}fps${
-      i.hasAudio ? ' / 音声あり' : ' / 音声なし'
-    }）`;
+    filenameEl.textContent = `${i.name}  ${i.width}x${i.height} / ${i.fps.toFixed(2)}fps${
+      i.hasAudio ? ' / audio' : ' / no audio'
+    }`;
     totalTimeEl.textContent = fmt(i.duration);
     dropHint.hidden = true;
     resumeBtn.hidden = true;
@@ -92,10 +100,10 @@ const player = new Player(canvas, {
     curTimeEl.textContent = fmt(t);
   },
   onState(playing) {
-    playPauseBtn.textContent = playing ? '⏸ 一時停止' : '▶ 再生';
+    playPauseBtn.textContent = playing ? 'Pause' : 'Play';
   },
   onInOut(inP, outP, loop) {
-    loopBtn.textContent = `ループ: ${loop ? 'ON' : 'OFF'}`;
+    loopBtn.textContent = `Loop: ${loop ? 'ON' : 'OFF'}`;
     loopBtn.classList.toggle('active', loop);
     const full = inP <= 0 && info != null && Math.abs(outP - info.duration) < 1e-3;
     inOutLabel.textContent = full ? '' : `In ${fmt(inP)} / Out ${fmt(outP)}`;
@@ -111,7 +119,6 @@ const timeline = new Timeline(timelineCanvas, {
   onSetOut: (t) => player.setOut(t),
 });
 
-// タイムライン／キャッシュ表示を常時更新。
 function uiLoop(): void {
   if (player.loaded) {
     timeline.render({
@@ -128,7 +135,6 @@ function uiLoop(): void {
 }
 requestAnimationFrame(uiLoop);
 
-// ---- ファイルを開く ------------------------------------------------------
 async function openFile(
   file: File,
   handle: FileSystemFileHandle | null,
@@ -137,6 +143,7 @@ async function openFile(
   try {
     showError(null);
     currentHandle = handle;
+    currentFile = file;
     await player.load(file, restore);
     await persistNow();
   } catch (e) {
@@ -149,6 +156,9 @@ async function persistNow(): Promise<void> {
   const s = player.getState();
   await savePersisted(currentHandle, {
     name: info.name,
+    size: currentFile?.size,
+    lastModified: currentFile?.lastModified,
+    duration: info.duration,
     lastTime: s.lastTime ?? 0,
     inPoint: s.inPoint ?? 0,
     outPoint: s.outPoint ?? player.duration,
@@ -156,11 +166,11 @@ async function persistNow(): Promise<void> {
   });
 }
 
-// ---- ドラッグ＆ドロップ --------------------------------------------------
 stage.addEventListener('dragover', (e) => {
   e.preventDefault();
   stage.classList.add('dragover');
 });
+
 stage.addEventListener('dragleave', () => stage.classList.remove('dragover'));
 stage.addEventListener('drop', (e) => void onDrop(e));
 
@@ -175,17 +185,9 @@ async function onDrop(e: DragEvent): Promise<void> {
   if (!file) return;
 
   const handle = item ? await getHandleFromDrop(item) : null;
-
-  // 同名動画なら前回設定を引き継ぐ。
-  let restore: RestoreState | undefined;
-  if (pendingRestore && pendingRestore.settings.name === file.name) {
-    const s = pendingRestore.settings;
-    restore = { lastTime: s.lastTime, inPoint: s.inPoint, outPoint: s.outPoint, loop: s.loop };
-  }
-  await openFile(file, handle, restore);
+  await openFile(file, handle, restoreForFile(file));
 }
 
-// ---- キーボード ---------------------------------------------------------
 window.addEventListener('keydown', (e) => {
   if (!player.loaded) return;
   const target = e.target as HTMLElement;
@@ -219,7 +221,6 @@ window.addEventListener('keydown', (e) => {
   }
 });
 
-// ---- ボタン -------------------------------------------------------------
 playPauseBtn.addEventListener('click', () => player.toggle());
 prevFrameBtn.addEventListener('click', () => void player.stepBackward());
 nextFrameBtn.addEventListener('click', () => void player.stepForward());
@@ -229,7 +230,6 @@ clearInOutBtn.addEventListener('click', () => player.clearInOut());
 loopBtn.addEventListener('click', () => player.toggleLoop());
 volume.addEventListener('input', () => player.setVolume(parseFloat(volume.value)));
 
-// ---- 復元用ボタン --------------------------------------------------------
 resumeBtn.addEventListener('click', () => void onResume());
 
 async function onResume(): Promise<void> {
@@ -237,35 +237,27 @@ async function onResume(): Promise<void> {
   const handle = pendingRestore.handle;
   const perm = await requestReadPermission(handle);
   if (perm !== 'granted') {
-    showError('ファイルへのアクセスが許可されませんでした。');
+    showError('File access was not granted.');
     return;
   }
+
   const file = await fileFromHandle(handle);
   if (!file) {
-    showError('前回のファイルが見つかりませんでした（移動・削除された可能性があります）。');
+    showError('The previous file could not be found.');
     await clearPersisted();
     resumeBtn.hidden = true;
     return;
   }
-  const s = pendingRestore.settings;
-  await openFile(file, handle, {
-    lastTime: s.lastTime,
-    inPoint: s.inPoint,
-    outPoint: s.outPoint,
-    loop: s.loop,
-  });
+
+  await openFile(file, handle, restoreForFile(file));
 }
 
-// ---- 設定の定期保存 ------------------------------------------------------
 setInterval(() => void persistNow(), 2000);
 window.addEventListener('pagehide', () => void persistNow());
 
-// ---- 起動時の復元 --------------------------------------------------------
 async function init(): Promise<void> {
   if (typeof VideoDecoder === 'undefined' || typeof VideoFrame === 'undefined') {
-    showError(
-      'このブラウザは WebCodecs に対応していません。最新の Chrome / Edge など対応ブラウザでご利用ください。',
-    );
+    showError('This browser does not support WebCodecs. Use a current Chrome or Edge.');
     return;
   }
 
@@ -277,25 +269,18 @@ async function init(): Promise<void> {
     if (perm === 'granted') {
       const file = await fileFromHandle(pendingRestore.handle);
       if (file) {
-        const s = pendingRestore.settings;
-        await openFile(file, pendingRestore.handle, {
-          lastTime: s.lastTime,
-          inPoint: s.inPoint,
-          outPoint: s.outPoint,
-          loop: s.loop,
-        });
+        await openFile(file, pendingRestore.handle, restoreForFile(file));
       } else {
         await clearPersisted();
       }
     } else {
-      resumeBtn.textContent = `前回の動画「${pendingRestore.settings.name}」を再開`;
+      resumeBtn.textContent = `Reopen ${pendingRestore.settings.name}`;
       resumeBtn.hidden = false;
     }
   } else {
-    // ハンドル無し：設定のみ保存していた。同名ファイルの再ドロップを促す。
     const sub = dropHint.querySelector('.sub');
     if (sub) {
-      sub.textContent = `前回の続き「${pendingRestore.settings.name}」を再生するには、同じ動画を再度ドロップしてください。`;
+      sub.textContent = `Drop ${pendingRestore.settings.name} again to resume.`;
     }
   }
 }
