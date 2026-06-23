@@ -92,8 +92,32 @@ export class Player {
   private stepDecodingTo = 0;
   private stepFrames = new Map<number, StepFrame>();
   private stepKeys: number[] = [];
-  private readonly stepRadius = 10;
-  private readonly maxStepFrames = 72;
+  /** UI フィルムストリップ表示用の固定半径（中央±10 = 21スロット）。キャッシュ容量とは独立。 */
+  private readonly filmstripRadius = 10;
+  /** ensureStepWindow が即時に満たすべき前後フレーム数（応答性優先の小窓）。 */
+  private readonly immediateRadius = 12;
+  /** 1フレームの推定バイト数（表示幅×高さ×RGBA 4byte）。load() で確定。 */
+  private bytesPerFrame = 1280 * 720 * 4;
+  /** 再生中のフレームキャッシュ予算（控えめ。再生デコードと併存するため）。 */
+  private readonly playingBudgetBytes = 256 * 1024 * 1024;
+  /** 一時停止中のフレームキャッシュ予算（deviceMemory から算出、上限2GB）。load() で確定。 */
+  private pausedBudgetBytes = 2 * 1024 * 1024 * 1024;
+
+  /** 現在の状態に応じたフレームキャッシュ予算（バイト）。一時停止中は大きく取る。 */
+  private get frameBudgetBytes(): number {
+    return this.playing ? this.playingBudgetBytes : this.pausedBudgetBytes;
+  }
+
+  /** 予算と1フレームbytesから決まる保持枚数上限。解像度に応じて自動調整しOOMを防ぐ。 */
+  private get maxStepFrames(): number {
+    return Math.max(24, Math.min(600, Math.floor(this.frameBudgetBytes / this.bytesPerFrame)));
+  }
+
+  /** 前後それぞれで満たすことを目指すフレーム数。一時停止中は容量いっぱいまで広げる。 */
+  private get stepRadius(): number {
+    if (this.playing) return this.immediateRadius;
+    return Math.max(this.immediateRadius, Math.floor(this.maxStepFrames / 2) - 2);
+  }
 
   constructor(
     private canvas: HTMLCanvasElement,
@@ -160,6 +184,12 @@ export class Player {
     }
     this.frameDuration = 1 / this.fps;
 
+    // フレームキャッシュ予算をこの動画の解像度・実機RAMから確定する。
+    // 1枚 = 表示幅×高さ×RGBA(4byte)。deviceMemory(GB) の 40% を上限2GBで一時停止予算とする。
+    this.bytesPerFrame = Math.max(1, this.canvas.width * this.canvas.height * 4);
+    const deviceMemoryGB = (navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 4;
+    this.pausedBudgetBytes = Math.min(deviceMemoryGB * 1024 * 0.4, 2048) * 1024 * 1024;
+
     const AudioContextCtor = window.AudioContext;
     this.audioContext = new AudioContextCtor({
       sampleRate: audioTrack ? await audioTrack.getSampleRate() : undefined,
@@ -225,6 +255,8 @@ export class Player {
     this.audioContextStartTime = this.audioContext.currentTime;
     this.playing = true;
     this.callbacks.onState(true);
+    // 再生に戻ったら予算が小さくなる。一時停止中に広げたキャッシュを再生予算まで縮める。
+    this.evictStepFrames(this.currentTime);
 
     if (this.audioSink) {
       void this.audioIterator?.return(undefined);
@@ -365,7 +397,7 @@ export class Player {
         this.currentTime = this.clampToPlaybackRange(frame.time);
         this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
         this.callbacks.onTime(this.currentTime);
-        if (this.framesAhead(this.currentTime) < this.stepRadius / 2) void this.prefetchStepWindow(this.currentTime);
+        if (this.framesAhead(this.currentTime) < this.immediateRadius) void this.prefetchStepWindow(this.currentTime);
       }
     } finally {
       this.stepping = false;
@@ -391,7 +423,7 @@ export class Player {
         this.currentTime = this.clampToPlaybackRange(frame.time);
         this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
         this.callbacks.onTime(this.currentTime);
-        if (this.framesBehind(this.currentTime) < this.stepRadius / 2) void this.prefetchStepWindow(this.currentTime);
+        if (this.framesBehind(this.currentTime) < this.immediateRadius) void this.prefetchStepWindow(this.currentTime);
       }
     } finally {
       this.stepping = false;
@@ -417,20 +449,32 @@ export class Player {
   }
 
   private async ensureStepWindow(center: number): Promise<void> {
-    if (this.framesBehind(center) >= this.stepRadius && this.framesAhead(center) >= this.stepRadius) return;
-    await this.prefetchStepWindow(center);
+    if (this.framesBehind(center) >= this.immediateRadius && this.framesAhead(center) >= this.immediateRadius) {
+      return;
+    }
+    // まず応答性優先の小窓だけを確実に確保する（広い先読みは別途バックグラウンドで行う）。
+    await this.prefetchStepWindow(center, false);
   }
 
-  private async prefetchStepWindow(center: number): Promise<void> {
+  /**
+   * 指定位置の前後フレームをデコードしてキャッシュする。
+   * - full=false: 即時の小窓だけを1パスで確保（コマ送りの応答性優先・await して使う）。
+   * - full=true : 一時停止中の広い窓を容量上限まで段階的に確保（背景で void 実行）。
+   */
+  private async prefetchStepWindow(center: number, full = true): Promise<void> {
     if (!this.videoSink) return;
     const gen = ++this.stepGen;
     await this.stopVideoIterator();
     this.stepDecoding = true;
 
     const clampedCenter = this.clampToPlaybackRange(center);
-    let span = Math.max(this.frameDuration * (this.stepRadius + 6), 0.5);
+    const targetRadius = full ? this.stepRadius : this.immediateRadius;
+    // 小窓から始めて倍々で広げる（内側が先に埋まり、コマ送りが早く効く）。
+    const baseSpan = Math.max(this.frameDuration * (this.immediateRadius + 6), 0.5);
+    const fullSpan = Math.max(this.frameDuration * (targetRadius + 6), baseSpan);
     try {
-      for (let attempt = 0; attempt < 3; attempt++) {
+      let span = baseSpan;
+      for (;;) {
         if (gen !== this.stepGen) return;
         const from = Math.max(this.inPoint, clampedCenter - span);
         const to = Math.min(this.outPoint, clampedCenter + span);
@@ -451,10 +495,11 @@ export class Player {
         }
 
         this.evictStepFrames(clampedCenter);
-        if (this.framesBehind(clampedCenter) >= this.stepRadius && this.framesAhead(clampedCenter) >= this.stepRadius) {
-          break;
-        }
-        span *= 2;
+        if (!full) break;
+        const haveEnough =
+          this.framesBehind(clampedCenter) >= targetRadius && this.framesAhead(clampedCenter) >= targetRadius;
+        if (haveEnough || span >= fullSpan) break;
+        span = Math.min(span * 2, fullSpan);
       }
     } finally {
       if (gen === this.stepGen) this.stepDecoding = false;
@@ -704,7 +749,7 @@ export class Player {
     const frames = this.stepKeys
       .map((key) => this.stepFrames.get(key))
       .filter((frame): frame is StepFrame => frame !== undefined);
-    if (frames.length <= this.stepRadius * 2 + 1) return frames;
+    if (frames.length <= this.filmstripRadius * 2 + 1) return frames;
 
     let currentIndex = 0;
     let bestDistance = Infinity;
@@ -716,9 +761,9 @@ export class Player {
       }
     }
 
-    let start = Math.max(0, currentIndex - this.stepRadius);
-    let end = Math.min(frames.length, currentIndex + this.stepRadius + 1);
-    const wanted = this.stepRadius * 2 + 1;
+    let start = Math.max(0, currentIndex - this.filmstripRadius);
+    let end = Math.min(frames.length, currentIndex + this.filmstripRadius + 1);
+    const wanted = this.filmstripRadius * 2 + 1;
     if (end - start < wanted) {
       if (start === 0) end = Math.min(frames.length, wanted);
       else start = Math.max(0, end - wanted);
