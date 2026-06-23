@@ -57,7 +57,7 @@ npm run preview  # ビルド結果をローカル確認
 
 ### Windows でのローカル確認 (Python)
 
-`run.bat` をダブルクリックすると、`dist` をビルドして `python -m http.server` で配信し、ブラウザを開きます（`npm install` 済みであること）。
+`run.bat` をダブルクリックすると、`dist` をビルドして `python -m http.server` で配信し（`http://localhost:8123/`）、ブラウザを自動で開きます（`npm install` 済みであること）。
 
 ## GitHub Pages へのデプロイ
 
