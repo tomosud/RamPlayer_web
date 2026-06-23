@@ -1,5 +1,5 @@
 import './style.css';
-import { Player, type LoadedInfo, type RestoreState } from './player/Player';
+import { Player, type LoadedInfo, type RestoreState, type StepFrame } from './player/Player';
 import { Timeline } from './ui/Timeline';
 import {
   clearPersisted,
@@ -25,6 +25,7 @@ const resumeBtn = $<HTMLButtonElement>('resumeBtn');
 const errorBox = $<HTMLDivElement>('error');
 const filenameEl = $<HTMLDivElement>('filename');
 const timelineCanvas = $<HTMLCanvasElement>('timeline');
+const filmstripCanvas = $<HTMLCanvasElement>('filmstrip');
 const curTimeEl = $<HTMLSpanElement>('curTime');
 const totalTimeEl = $<HTMLSpanElement>('totalTime');
 const inOutLabel = $<HTMLSpanElement>('inOutLabel');
@@ -83,6 +84,70 @@ function restoreForFile(file: File): RestoreState | undefined {
   };
 }
 
+function renderFilmstrip(frames: StepFrame[], currentTime: number): void {
+  const dpr = window.devicePixelRatio || 1;
+  const wCss = filmstripCanvas.clientWidth || 1;
+  const hCss = filmstripCanvas.clientHeight || 82;
+  const width = Math.round(wCss * dpr);
+  const height = Math.round(hCss * dpr);
+  if (filmstripCanvas.width !== width || filmstripCanvas.height !== height) {
+    filmstripCanvas.width = width;
+    filmstripCanvas.height = height;
+  }
+
+  const ctx = filmstripCanvas.getContext('2d');
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, wCss, hCss);
+  ctx.fillStyle = '#0f1116';
+  ctx.fillRect(0, 0, wCss, hCss);
+
+  if (frames.length === 0) {
+    ctx.fillStyle = '#626b78';
+    ctx.font = '12px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('Frame cache appears while paused', wCss / 2, hCss / 2);
+    return;
+  }
+
+  const visibleSlots = 21;
+  const centerSlot = Math.floor(visibleSlots / 2);
+  const gap = 4;
+  const slotW = Math.max(28, (wCss - gap * (visibleSlots + 1)) / visibleSlots);
+  const slotH = hCss - 10;
+  let nearestIndex = 0;
+  let activeDistance = Infinity;
+  for (let i = 0; i < frames.length; i++) {
+    const distance = Math.abs(frames[i].time - currentTime);
+    if (distance < activeDistance) {
+      activeDistance = distance;
+      nearestIndex = i;
+    }
+  }
+
+  for (let slot = 0; slot < visibleSlots; slot++) {
+    const frameIndex = nearestIndex + slot - centerSlot;
+    const frame = frames[frameIndex] ?? null;
+    const x = gap + slot * (slotW + gap);
+    const y = 5;
+
+    ctx.fillStyle = '#06070a';
+    ctx.fillRect(x, y, slotW, slotH);
+    if (frame) {
+      const scale = Math.max(slotW / frame.canvas.width, slotH / frame.canvas.height);
+      const sw = slotW / scale;
+      const sh = slotH / scale;
+      const sx = Math.max(0, (frame.canvas.width - sw) / 2);
+      const sy = Math.max(0, (frame.canvas.height - sh) / 2);
+      ctx.drawImage(frame.canvas, sx, sy, sw, sh, x, y, slotW, slotH);
+    }
+    ctx.strokeStyle = slot === centerSlot ? '#ff5a5a' : '#333a46';
+    ctx.lineWidth = slot === centerSlot ? 2 : 1;
+    ctx.strokeRect(x + 0.5, y + 0.5, slotW - 1, slotH - 1);
+  }
+}
+
 setControlsEnabled(false);
 
 const player = new Player(canvas, {
@@ -127,9 +192,10 @@ function uiLoop(): void {
       inPoint: player.inPoint,
       outPoint: player.outPoint,
       ranges: player.cacheRanges(),
-      decodingFrom: 0,
+      decodingFrom: player.decodingFrom,
       decodingTo: player.decodingTo,
     });
+    renderFilmstrip(player.stepStripFrames(), player.currentTime);
   }
   requestAnimationFrame(uiLoop);
 }

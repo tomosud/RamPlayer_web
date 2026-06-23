@@ -19,11 +19,8 @@ export interface TimelineCallbacks {
 const css = (name: string) =>
   getComputedStyle(document.documentElement).getPropertyValue(name).trim() || '#888';
 
-/**
- * タイムライン描画とインタラクション。
- * 色分け：デコード済み範囲 / デコード中 / In-Out 範囲 / 再生位置。
- * In/Out マーカーはドラッグで変更できる。
- */
+const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+
 export class Timeline {
   private ctx: CanvasRenderingContext2D;
   private state: TimelineState = {
@@ -37,6 +34,8 @@ export class Timeline {
   };
   private drag: 'in' | 'out' | 'seek' | null = null;
   private readonly handleHitPx = 10;
+  private viewStart = 0;
+  private viewEnd = 0;
 
   constructor(
     private canvas: HTMLCanvasElement,
@@ -48,6 +47,7 @@ export class Timeline {
 
     canvas.addEventListener('pointerdown', this.onDown);
     canvas.addEventListener('pointermove', this.onMove);
+    canvas.addEventListener('wheel', this.onWheel, { passive: false });
     window.addEventListener('pointerup', this.onUp);
     window.addEventListener('resize', () => this.render(this.state));
   }
@@ -56,118 +56,156 @@ export class Timeline {
     return this.canvas.clientWidth || 1;
   }
 
+  private get viewSpan(): number {
+    return Math.max(this.viewEnd - this.viewStart, 1e-6);
+  }
+
+  private ensureView(): void {
+    if (this.state.duration <= 0) {
+      this.viewStart = 0;
+      this.viewEnd = 0;
+      return;
+    }
+    if (this.viewEnd <= this.viewStart || this.viewEnd > this.state.duration) {
+      this.viewStart = 0;
+      this.viewEnd = this.state.duration;
+    }
+  }
+
   private timeToX(t: number): number {
-    if (this.state.duration <= 0) return 0;
-    return (t / this.state.duration) * this.widthCss;
+    this.ensureView();
+    return ((t - this.viewStart) / this.viewSpan) * this.widthCss;
   }
 
   private xToTime(x: number): number {
-    const w = this.widthCss;
-    const t = (x / w) * this.state.duration;
-    return Math.max(0, Math.min(this.state.duration, t));
+    this.ensureView();
+    return clamp(this.viewStart + (x / this.widthCss) * this.viewSpan, 0, this.state.duration);
   }
 
-  private eventX(e: PointerEvent): number {
+  private localX(clientX: number): number {
     const rect = this.canvas.getBoundingClientRect();
-    return e.clientX - rect.left;
+    return clientX - rect.left;
   }
 
   private onDown = (e: PointerEvent): void => {
     if (this.state.duration <= 0) return;
     this.canvas.setPointerCapture(e.pointerId);
-    const x = this.eventX(e);
+    const x = this.localX(e.clientX);
     const inX = this.timeToX(this.state.inPoint);
     const outX = this.timeToX(this.state.outPoint);
 
-    if (Math.abs(x - inX) <= this.handleHitPx) {
-      this.drag = 'in';
-    } else if (Math.abs(x - outX) <= this.handleHitPx) {
-      this.drag = 'out';
-    } else {
+    if (Math.abs(x - inX) <= this.handleHitPx) this.drag = 'in';
+    else if (Math.abs(x - outX) <= this.handleHitPx) this.drag = 'out';
+    else {
       this.drag = 'seek';
       this.callbacks.onSeek(this.xToTime(x));
     }
   };
 
   private onMove = (e: PointerEvent): void => {
+    const x = this.localX(e.clientX);
     if (!this.drag) {
-      // ホバー時のカーソル変更
-      const x = this.eventX(e);
       const near =
         Math.abs(x - this.timeToX(this.state.inPoint)) <= this.handleHitPx ||
         Math.abs(x - this.timeToX(this.state.outPoint)) <= this.handleHitPx;
       this.canvas.style.cursor = near ? 'ew-resize' : 'pointer';
       return;
     }
-    const t = this.xToTime(this.eventX(e));
+
+    const t = this.xToTime(x);
     if (this.drag === 'in') this.callbacks.onSetIn(t);
     else if (this.drag === 'out') this.callbacks.onSetOut(t);
     else this.callbacks.onSeek(t);
   };
 
   private onUp = (e: PointerEvent): void => {
-    if (this.drag) {
-      try {
-        this.canvas.releasePointerCapture(e.pointerId);
-      } catch {
-        /* ignore */
-      }
-      this.drag = null;
+    if (!this.drag) return;
+    try {
+      this.canvas.releasePointerCapture(e.pointerId);
+    } catch {
+      // Ignore stale pointer capture.
     }
+    this.drag = null;
+  };
+
+  private onWheel = (e: WheelEvent): void => {
+    if (this.state.duration <= 0) return;
+    e.preventDefault();
+
+    this.ensureView();
+    const anchor = this.xToTime(this.localX(e.clientX));
+    const factor = e.deltaY < 0 ? 0.8 : 1.25;
+    const minSpan = Math.max(0.25, this.state.duration / 500);
+    const nextSpan = clamp(this.viewSpan * factor, minSpan, this.state.duration);
+    const anchorRatio = (anchor - this.viewStart) / this.viewSpan;
+    const start = clamp(anchor - anchorRatio * nextSpan, 0, this.state.duration - nextSpan);
+    this.viewStart = start;
+    this.viewEnd = start + nextSpan;
+    this.render(this.state);
   };
 
   render(state: TimelineState): void {
     this.state = state;
+    this.ensureView();
+
     const dpr = window.devicePixelRatio || 1;
     const wCss = this.widthCss;
-    const hCss = this.canvas.clientHeight || 44;
-    // 解像度を CSS サイズ × dpr に合わせる。
-    if (this.canvas.width !== Math.round(wCss * dpr) || this.canvas.height !== Math.round(hCss * dpr)) {
-      this.canvas.width = Math.round(wCss * dpr);
-      this.canvas.height = Math.round(hCss * dpr);
+    const hCss = this.canvas.clientHeight || 18;
+    const width = Math.round(wCss * dpr);
+    const height = Math.round(hCss * dpr);
+    if (this.canvas.width !== width || this.canvas.height !== height) {
+      this.canvas.width = width;
+      this.canvas.height = height;
     }
+
     const ctx = this.ctx;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, wCss, hCss);
+    if (state.duration <= 0) return;
 
-    const { duration } = state;
-    if (duration <= 0) return;
-
-    // 背景
     ctx.fillStyle = css('--panel-2');
     ctx.fillRect(0, 0, wCss, hCss);
 
-    // デコード済みフレーム範囲
     ctx.fillStyle = css('--decoded');
     for (const r of state.ranges) {
       const x0 = this.timeToX(r.start);
       const x1 = this.timeToX(r.end);
-      ctx.fillRect(x0, 0, Math.max(1, x1 - x0), hCss);
+      if (x1 < 0 || x0 > wCss) continue;
+      ctx.fillRect(Math.max(0, x0), 0, Math.min(wCss, x1) - Math.max(0, x0), hCss);
     }
 
-    // デコード中（先読みフロンティアの少し先を細く表示）
     if (state.decodingTo > state.decodingFrom) {
-      const x0 = this.timeToX(state.decodingTo);
-      const x1 = this.timeToX(Math.min(duration, state.decodingTo + 0.25));
-      ctx.fillStyle = css('--decoding');
-      ctx.fillRect(x0, 0, Math.max(2, x1 - x0), hCss);
+      const x0 = this.timeToX(state.decodingFrom);
+      const x1 = this.timeToX(state.decodingTo);
+      if (x1 >= 0 && x0 <= wCss) {
+        ctx.fillStyle = css('--decoding');
+        ctx.fillRect(Math.max(0, x0), 0, Math.max(2, Math.min(wCss, x1) - Math.max(0, x0)), hCss);
+      }
     }
 
-    // In/Out 範囲（半透明オーバーレイ＋マーカー）
     const inX = this.timeToX(state.inPoint);
     const outX = this.timeToX(state.outPoint);
-    ctx.fillStyle = css('--inout');
-    ctx.fillRect(inX, 0, outX - inX, hCss);
-    ctx.fillStyle = css('--inout-marker');
-    ctx.fillRect(inX - 1, 0, 3, hCss);
-    ctx.fillRect(outX - 2, 0, 3, hCss);
-    // マーカーの掴み代（上下の三角風ハンドル）
-    ctx.fillRect(inX - 4, 0, 8, 6);
-    ctx.fillRect(outX - 4, hCss - 6, 8, 6);
+    const bandX0 = Math.max(0, inX);
+    const bandX1 = Math.min(wCss, outX);
+    if (bandX1 > bandX0) {
+      ctx.fillStyle = css('--inout');
+      ctx.fillRect(bandX0, 0, bandX1 - bandX0, hCss);
+    }
 
-    // 再生位置
+    ctx.fillStyle = css('--inout-marker');
+    if (inX >= -4 && inX <= wCss + 4) {
+      ctx.fillRect(inX - 1, 0, 3, hCss);
+      ctx.fillRect(inX - 4, 0, 8, 5);
+    }
+    if (outX >= -4 && outX <= wCss + 4) {
+      ctx.fillRect(outX - 2, 0, 3, hCss);
+      ctx.fillRect(outX - 4, hCss - 5, 8, 5);
+    }
+
     const px = this.timeToX(state.currentTime);
-    ctx.fillStyle = css('--playhead');
-    ctx.fillRect(px - 1, 0, 2, hCss);
+    if (px >= -2 && px <= wCss + 2) {
+      ctx.fillStyle = css('--playhead');
+      ctx.fillRect(px - 1, 0, 2, hCss);
+    }
   }
 }
