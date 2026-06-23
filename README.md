@@ -2,7 +2,10 @@
 
 RamPlayer Web はここで使えます: https://tomosud.github.io/RamPlayer_web/
 
-RamPlayer Web は、アニメーション作画・編集・演出チェックなどの参考用コマ送りに特化した、ブラウザ上で動く動画ビュワーです。
+<img width="1333" height="782" alt="image" src="https://github.com/user-attachments/assets/81cded36-1c33-4ad9-a9a0-e790d78340b4" />
+
+
+RamPlayer Web は、アニメーション作成などの参考用コマ送りに特化した、ブラウザ上で動く動画ビュワーです。
 
 動画ファイルはサーバーへ送信せず、手元のブラウザ内で読み込みます。通常再生よりも、一時停止中に前後のフレームを先読みして、左右キーで素早く 1 コマずつ確認する用途を重視しています。
 
