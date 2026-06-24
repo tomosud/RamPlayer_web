@@ -4,6 +4,15 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>RamPlayer Web</title>
+    <!-- Collects access counts for this site. Remove this Google Analytics tag if you fork this project. -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-2JKNSTR6DZ"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'G-2JKNSTR6DZ');
+    </script>
   </head>
   <body>
     <div id="app">
@@ -28,6 +37,14 @@
       <div id="timelinePreview" class="timeline-preview" hidden>
         <canvas id="timelinePreviewCanvas"></canvas>
         <span id="timelinePreviewTime">00:00.000</span>
+      </div>
+      <div id="scaleContextMenu" class="context-menu" hidden>
+        <button data-scale="fit">Fit</button>
+        <button data-scale="0.1">10%</button>
+        <button data-scale="0.25">25%</button>
+        <button data-scale="0.5">50%</button>
+        <button data-scale="1">100%</button>
+        <button data-scale="custom" disabled>Custom</button>
       </div>
 
       <button id="showUiBtn" class="show-ui-btn" hidden>Controls ▲</button>

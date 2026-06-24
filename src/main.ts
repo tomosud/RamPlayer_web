@@ -35,6 +35,7 @@ const timelineCanvas = $<HTMLCanvasElement>('timeline');
 const timelinePreview = $<HTMLDivElement>('timelinePreview');
 const timelinePreviewCanvas = $<HTMLCanvasElement>('timelinePreviewCanvas');
 const timelinePreviewTime = $<HTMLSpanElement>('timelinePreviewTime');
+const scaleContextMenu = $<HTMLDivElement>('scaleContextMenu');
 const filmstripCanvas = $<HTMLCanvasElement>('filmstrip');
 const curTimeEl = $<HTMLSpanElement>('curTime');
 const totalTimeEl = $<HTMLSpanElement>('totalTime');
@@ -781,6 +782,37 @@ function fitVideoToStage(): void {
   applyVideoView();
 }
 
+function applyViewScaleValue(value: string): void {
+  if (value === 'fit') {
+    fitVideoToStage();
+    return;
+  }
+  if (value === 'custom') return;
+
+  videoPanX = 0;
+  videoPanY = 0;
+  viewScaleMode = 'custom';
+  videoScale = Number(value);
+  applyVideoView();
+}
+
+function closeScaleContextMenu(): void {
+  scaleContextMenu.hidden = true;
+}
+
+function openScaleContextMenu(clientX: number, clientY: number): void {
+  if (!player.loaded || exportRunning) return;
+  closeScaleContextMenu();
+  scaleContextMenu.hidden = false;
+
+  const margin = 6;
+  const rect = scaleContextMenu.getBoundingClientRect();
+  const left = Math.min(window.innerWidth - rect.width - margin, Math.max(margin, clientX));
+  const top = Math.min(window.innerHeight - rect.height - margin, Math.max(margin, clientY));
+  scaleContextMenu.style.left = `${left}px`;
+  scaleContextMenu.style.top = `${top}px`;
+}
+
 function resetLayout(): void {
   topbar.hidden = false;
   app.classList.remove('chrome-hidden');
@@ -1091,7 +1123,10 @@ stage.addEventListener('dragover', (e) => {
 
 stage.addEventListener('dragleave', () => stage.classList.remove('dragover'));
 stage.addEventListener('drop', (e) => void onDrop(e));
-stage.addEventListener('contextmenu', (e) => e.preventDefault());
+stage.addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+  openScaleContextMenu(e.clientX, e.clientY);
+});
 for (const c of [canvas, timelineCanvas, filmstripCanvas, timelinePreviewCanvas]) {
   c.addEventListener('contextmenu', (e) => e.preventDefault());
 }
@@ -1263,22 +1298,28 @@ volumeToggle.addEventListener('click', (e) => {
   setVolumePanelOpen(volumePanel.hidden);
 });
 volumePopover.addEventListener('click', (e) => e.stopPropagation());
-document.addEventListener('click', () => setVolumePanelOpen(false));
+document.addEventListener('click', () => {
+  setVolumePanelOpen(false);
+  closeScaleContextMenu();
+});
 window.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') setVolumePanelOpen(false);
+  if (e.key === 'Escape') {
+    setVolumePanelOpen(false);
+    closeScaleContextMenu();
+  }
 });
 viewFitBtn.addEventListener('click', () => fitVideoToStage());
 viewScale.addEventListener('change', () => {
-  if (viewScale.value === 'fit') {
-    fitVideoToStage();
-  } else {
-    videoPanX = 0;
-    videoPanY = 0;
-    viewScaleMode = 'custom';
-    videoScale = Number(viewScale.value);
-    applyVideoView();
-  }
+  applyViewScaleValue(viewScale.value);
   blurControl(viewScale);
+});
+scaleContextMenu.addEventListener('click', (e) => {
+  e.stopPropagation();
+  const button = (e.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-scale]');
+  if (!button || button.disabled) return;
+  applyViewScaleValue(button.dataset.scale ?? 'fit');
+  closeScaleContextMenu();
+  blurControl(button);
 });
 resetViewBtn.addEventListener('click', () => resetLayout());
 closeUiBtn.addEventListener('click', () => {

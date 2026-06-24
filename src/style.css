@@ -372,6 +372,32 @@ button.active {
   font-variant-numeric: tabular-nums;
 }
 
+.context-menu {
+  position: fixed;
+  z-index: 70;
+  min-width: 96px;
+  padding: 4px;
+  background: rgba(17, 20, 27, 0.97);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  box-shadow: 0 14px 38px rgba(0, 0, 0, 0.48);
+  backdrop-filter: blur(12px);
+}
+
+.context-menu button {
+  width: 100%;
+  justify-content: flex-start;
+  display: flex;
+  border: none;
+  background: transparent;
+  border-radius: 5px;
+  text-align: left;
+}
+
+.context-menu button:hover:not(:disabled) {
+  background: var(--panel-2);
+}
+
 .filmstrip-wrap {
   width: 100%;
   min-height: 64px;
