@@ -232,16 +232,36 @@ body {
 .legend {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
 }
 
 .zoom-select,
+.fps-control,
 .vol {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   color: var(--muted);
   white-space: nowrap;
+}
+
+.volume-popover {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  margin-left: auto;
+}
+
+.volume-panel {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  padding: 8px 10px;
+  background: rgba(17, 20, 27, 0.96);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.44);
+  backdrop-filter: blur(12px);
 }
 
 select,
@@ -261,8 +281,34 @@ select {
   color: #e6ebf3;
 }
 
+input[type="number"] {
+  min-height: 28px;
+  width: 72px;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.fps-control select {
+  width: 104px;
+}
+
+.fps-control input {
+  width: 66px;
+}
+
+input[type="number"]:disabled {
+  opacity: 0.48;
+  cursor: default;
+}
+
 button:hover:not(:disabled),
-select:hover {
+select:hover,
+input[type="number"]:hover:not(:disabled) {
   background: #303747;
 }
 
@@ -543,7 +589,20 @@ button.active {
     margin-left: 0;
   }
 
+  .fps-control input {
+    width: 62px;
+  }
+
+  .fps-control select {
+    width: 96px;
+  }
+
+  .volume-panel {
+    right: auto;
+    left: 0;
+  }
+
   .vol input {
-    width: 112px;
+    width: 120px;
   }
 }

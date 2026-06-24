@@ -49,6 +49,11 @@ const closeUiBtn = $<HTMLButtonElement>('closeUiBtn');
 const resetViewBtn = $<HTMLButtonElement>('resetViewBtn');
 const viewFitBtn = $<HTMLButtonElement>('viewFitBtn');
 const viewScale = $<HTMLSelectElement>('viewScale');
+const playbackFpsMode = $<HTMLSelectElement>('playbackFpsMode');
+const playbackFpsInput = $<HTMLInputElement>('playbackFps');
+const volumePopover = $<HTMLDivElement>('volumePopover');
+const volumeToggle = $<HTMLButtonElement>('volumeToggle');
+const volumePanel = $<HTMLDivElement>('volumePanel');
 
 const playPauseBtn = $<HTMLButtonElement>('playPause');
 const prevFrameBtn = $<HTMLButtonElement>('prevFrame');
@@ -153,6 +158,11 @@ function fmtBitrate(bitsPerSecond: number): string {
   if (!isFinite(bitsPerSecond) || bitsPerSecond <= 0) return '0 kbps';
   if (bitsPerSecond >= 1_000_000) return `${(bitsPerSecond / 1_000_000).toFixed(2)} Mbps`;
   return `${Math.round(bitsPerSecond / 1000)} kbps`;
+}
+
+function fmtFps(fps: number): string {
+  if (!isFinite(fps) || fps <= 0) return '0';
+  return fps.toFixed(Math.abs(fps - Math.round(fps)) < 0.005 ? 0 : 2);
 }
 
 function wantsCopyExport(): boolean {
@@ -457,6 +467,10 @@ function showError(msg: string | null): void {
 
 function setControlsEnabled(on: boolean): void {
   for (const b of controlButtons) b.disabled = !on;
+  playbackFpsMode.disabled = !on;
+  playbackFpsInput.disabled = !on;
+  volumeToggle.disabled = !on;
+  if (!on) setVolumePanelOpen(false);
 }
 
 function setExportStatus(message: string, isError = false): void {
@@ -775,6 +789,92 @@ function resetLayout(): void {
   fitVideoToStage();
 }
 
+function updateMediaInfo(): void {
+  if (!info) {
+    mediaInfo.textContent = '';
+    return;
+  }
+  const playback = player.playbackFps == null
+    ? 'play original'
+    : `play ${fmtFps(player.effectivePlaybackFps)}fps`;
+  mediaInfo.textContent = `${fmt(info.duration)} / ${info.width}x${info.height} / ${fmtFps(info.fps)}fps source / ${playback} / ${
+    info.hasAudio ? 'audio' : 'no audio'
+  }`;
+}
+
+function syncPlaybackFpsControls(): void {
+  playbackFpsMode.value = playbackFpsModeForCurrentValue();
+  playbackFpsInput.value = fmtFps(player.effectivePlaybackFps);
+  playbackFpsInput.disabled = !player.loaded;
+  updateMediaInfo();
+}
+
+function playbackFpsModeForCurrentValue(): string {
+  if (!player.loaded || player.playbackFps == null || !info) return 'original';
+  const fps = player.playbackFps;
+  const source = info.fps;
+  const matches = (target: number) => Math.abs(fps - target) < 0.005;
+  if (matches(source / 4)) return 'quarter';
+  if (matches(source / 2)) return 'half';
+  if (matches(source * 2)) return 'double';
+  if (matches(source * 4)) return 'quad';
+  return 'custom';
+}
+
+function presetPlaybackFps(mode: string): number | null {
+  if (!info) return null;
+  switch (mode) {
+    case 'quarter':
+      return info.fps / 4;
+    case 'half':
+      return info.fps / 2;
+    case 'double':
+      return info.fps * 2;
+    case 'quad':
+      return info.fps * 4;
+    case 'original':
+      return null;
+    default:
+      return Number(playbackFpsInput.value);
+  }
+}
+
+function applyPlaybackFpsPreset(): void {
+  if (!player.loaded) return;
+  const fps = presetPlaybackFps(playbackFpsMode.value);
+  if (playbackFpsMode.value === 'original') {
+    player.setPlaybackFps(null);
+    syncPlaybackFpsControls();
+    void persistNow();
+    return;
+  }
+
+  if (fps == null || !isFinite(fps) || fps <= 0) {
+    syncPlaybackFpsControls();
+    return;
+  }
+
+  player.setPlaybackFps(fps);
+  syncPlaybackFpsControls();
+  void persistNow();
+}
+
+function applyPlaybackFpsInput(): void {
+  if (!player.loaded) return;
+  playbackFpsMode.value = 'custom';
+  const fps = Number(playbackFpsInput.value);
+  if (!isFinite(fps) || fps <= 0) return;
+  player.setPlaybackFps(fps);
+  updateMediaInfo();
+  void persistNow();
+}
+
+function setVolumePanelOpen(open: boolean): void {
+  volumePanel.hidden = !open;
+  volumeToggle.classList.toggle('active', open);
+  volumeToggle.setAttribute('aria-expanded', String(open));
+}
+
 function restoreForFile(file: File): RestoreState | undefined {
   const s = pendingRestore?.settings;
   if (!s) return undefined;
@@ -787,6 +887,7 @@ function restoreForFile(file: File): RestoreState | undefined {
     inPointSet: s.inPointSet,
     outPointSet: s.outPointSet,
     loop: s.loop,
+    playbackFps: s.playbackFps,
   };
 }
 
@@ -866,9 +967,7 @@ const player = new Player(canvas, {
     info = i;
     resetTimelineThumbnails();
     filenameEl.textContent = i.name;
-    mediaInfo.textContent = `${fmt(i.duration)} / ${i.width}x${i.height} / ${i.fps.toFixed(2)}fps / ${
-      i.hasAudio ? 'audio' : 'no audio'
-    }`;
+    syncPlaybackFpsControls();
     totalTimeEl.textContent = fmt(i.duration);
     updateTimeReadout(player.currentTime);
     fitVideoToStage();
@@ -981,6 +1080,7 @@ async function persistNow(): Promise<void> {
     inPointSet: s.inPointSet,
     outPointSet: s.outPointSet,
     loop: s.loop ?? true,
+    playbackFps: s.playbackFps,
   });
 }
 
@@ -991,6 +1091,10 @@ stage.addEventListener('dragover', (e) => {
 
 stage.addEventListener('dragleave', () => stage.classList.remove('dragover'));
 stage.addEventListener('drop', (e) => void onDrop(e));
+stage.addEventListener('contextmenu', (e) => e.preventDefault());
+for (const c of [canvas, timelineCanvas, filmstripCanvas, timelinePreviewCanvas]) {
+  c.addEventListener('contextmenu', (e) => e.preventDefault());
+}
 
 stage.addEventListener('wheel', (e) => {
   if (!player.loaded || exportRunning) return;
@@ -1062,7 +1166,6 @@ window.addEventListener('keydown', (e) => {
   }
   if (!player.loaded) return;
   if (exportRunning) return;
-  if (isShortcutInputTarget(e.target)) return;
 
   switch (e.key) {
     case ' ':
@@ -1128,7 +1231,26 @@ clearInOutBtn.addEventListener('click', () => {
 });
 loopBtn.addEventListener('click', () => player.toggleLoop());
 exportClipBtn.addEventListener('click', () => openExportDialog());
-exportTargetSize.addEventListener('change', () => updateExportDialog());
+playbackFpsMode.addEventListener('change', () => {
+  applyPlaybackFpsPreset();
+  blurControl(playbackFpsMode);
+});
+playbackFpsInput.addEventListener('input', () => applyPlaybackFpsInput());
+playbackFpsInput.addEventListener('change', () => {
+  applyPlaybackFpsInput();
+  blurControl(playbackFpsInput);
+});
+playbackFpsInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    applyPlaybackFpsInput();
+    playbackFpsInput.blur();
+  }
+});
+exportTargetSize.addEventListener('change', () => {
+  updateExportDialog();
+  blurControl(exportTargetSize);
+});
 exportStartBtn.addEventListener('click', () => void runExport());
 exportCloseBtn.addEventListener('click', () => closeExportDialog());
 exportCancelBtn.addEventListener('click', () => requestExportCancel());
@@ -1136,6 +1258,15 @@ exportDialog.addEventListener('click', (e) => {
   if (e.target === exportDialog && !exportCloseBtn.disabled) closeExportDialog();
 });
 volume.addEventListener('input', () => player.setVolume(parseFloat(volume.value)));
+volumeToggle.addEventListener('click', (e) => {
+  e.stopPropagation();
+  setVolumePanelOpen(volumePanel.hidden);
+});
+volumePopover.addEventListener('click', (e) => e.stopPropagation());
+document.addEventListener('click', () => setVolumePanelOpen(false));
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') setVolumePanelOpen(false);
+});
 viewFitBtn.addEventListener('click', () => fitVideoToStage());
 viewScale.addEventListener('change', () => {
   if (viewScale.value === 'fit') {
@@ -1147,6 +1278,7 @@ viewScale.addEventListener('change', () => {
     videoScale = Number(viewScale.value);
     applyVideoView();
   }
+  blurControl(viewScale);
 });
 resetViewBtn.addEventListener('click', () => resetLayout());
 closeUiBtn.addEventListener('click', () => {

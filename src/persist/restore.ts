@@ -18,6 +18,7 @@ export interface PersistedSettings {
   inPointSet?: boolean;
   outPointSet?: boolean;
   loop: boolean;
+  playbackFps?: number | null;
 }
 
 export interface PersistedRecord {

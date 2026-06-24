@@ -34,6 +34,7 @@ export interface RestoreState {
   inPointSet?: boolean;
   outPointSet?: boolean;
   loop?: boolean;
+  playbackFps?: number | null;
 }
 
 export interface StepFrame {
@@ -80,6 +81,7 @@ export class Player {
   duration = 0;
   fps = 30;
   frameDuration = 1 / 30;
+  playbackFps: number | null = null;
   playing = false;
   loop = true;
   inPoint = 0;
@@ -213,6 +215,7 @@ export class Player {
       this.thumbnailSink = null;
     }
     this.frameDuration = 1 / this.fps;
+    this.playbackFps = this.sanitizePlaybackFps(restore?.playbackFps ?? null);
 
     // フレームキャッシュ予算をこの動画の解像度・実機RAMから確定する。
     // 1枚 = 表示幅×高さ×RGBA(4byte)。deviceMemory(GB) の 40% を上限2GBで一時停止予算とする。
@@ -372,14 +375,15 @@ export class Player {
         if (id !== this.asyncId || !this.playing) break;
         const node = this.audioContext.createBufferSource();
         node.buffer = buffer;
+        node.playbackRate.value = this.playbackRate;
         node.connect(this.gainNode);
 
-        let startTime = this.audioContextStartTime + timestamp - this.playbackMediaAtStart;
+        let startTime = this.audioContextStartTime + (timestamp - this.playbackMediaAtStart) / this.playbackRate;
         startTime = Math.round(this.audioContext.sampleRate * startTime) / this.audioContext.sampleRate;
         if (startTime >= this.audioContext.currentTime) {
           node.start(startTime);
         } else {
-          node.start(this.audioContext.currentTime, this.audioContext.currentTime - startTime);
+          node.start(this.audioContext.currentTime, (this.audioContext.currentTime - startTime) * this.playbackRate);
         }
 
         this.queuedAudioNodes.add(node);
@@ -912,7 +916,9 @@ export class Player {
 
   private getPlaybackTime(): number {
     if (!this.playing || !this.audioContext) return this.currentTime;
-    return this.fromMediaTime(this.audioContext.currentTime - this.audioContextStartTime + this.playbackMediaAtStart);
+    return this.fromMediaTime(
+      (this.audioContext.currentTime - this.audioContextStartTime) * this.playbackRate + this.playbackMediaAtStart,
+    );
   }
 
   private stopPlaybackSideEffects(emitState = false): void {
@@ -982,6 +988,20 @@ export class Player {
     return Math.round(time * 1e6);
   }
 
+  private get playbackRate(): number {
+    return Math.max(0.001, this.effectivePlaybackFps / Math.max(this.fps, 0.001));
+  }
+
+  get effectivePlaybackFps(): number {
+    return this.playbackFps ?? this.fps;
+  }
+
+  private sanitizePlaybackFps(value: number | null | undefined): number | null {
+    if (value == null) return null;
+    if (!isFinite(value) || value <= 0) return null;
+    return clamp(value, 0.1, 1000);
+  }
+
   setIn(time: number = this.currentTime): void {
     this.inPoint = clamp(time, 0, Math.max(0, this.outPoint - this.eps));
     this.inPointSet = true;
@@ -1011,6 +1031,22 @@ export class Player {
 
   toggleLoop(): void {
     this.setLoop(!this.loop);
+  }
+
+  setPlaybackFps(value: number | null): void {
+    const next = this.sanitizePlaybackFps(value);
+    if (next === this.playbackFps) return;
+
+    const wasPlaying = this.playing;
+    const visibleTime = wasPlaying ? this.getPlaybackTime() : this.currentTime;
+    if (wasPlaying) this.stopPlaybackSideEffects();
+
+    this.playbackFps = next;
+    this.currentTime = this.clampToPlaybackRange(visibleTime);
+    this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
+    this.callbacks.onTime(this.currentTime);
+
+    if (wasPlaying) void this.play();
   }
 
   setVolume(v: number): void {
@@ -1096,6 +1132,7 @@ export class Player {
       inPointSet: this.inPointSet,
       outPointSet: this.outPointSet,
       loop: this.loop,
+      playbackFps: this.playbackFps,
     };
   }
 
