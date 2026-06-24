@@ -103,6 +103,10 @@ export class Player {
   private readonly filmstripRadius = 10;
   /** 次フレームが欠けたときに即時確保する前後フレーム数（応答性優先の小窓）。 */
   private readonly immediateRadius = 12;
+  /** 初回先読みで確保する前後フレーム数。数コマ分を先に軽く読む。 */
+  private readonly initialPrefetchRadius = 6;
+  /** 小窓から最大範囲まで広げる先読み段数。 */
+  private readonly stagedPrefetchPasses = 3;
   private readonly refillThresholdRatio = 0.5;
   /** 1フレームの推定バイト数（表示幅×高さ×RGBA 4byte）。load() で確定。 */
   private bytesPerFrame = 1280 * 720 * 4;
@@ -557,8 +561,8 @@ export class Player {
 
   /**
    * 指定位置の前後フレームをデコードしてキャッシュする。
-   * - full=false: 即時の小窓だけを確保（コマ送りの応答性優先・await して使う）。
-   * - full=true : 一時停止中の広い窓を容量上限まで確保（背景で void 実行）。
+   * - まず小さい半径を前方→後方の順に読む。
+   * - その後、半径を段階的に広げながら前方/後方をチャンク単位で交互に読む。
    *
    * 既にキャッシュ済みの連続区間は再デコードせず、不足している外側だけを取得する。
    * デコードループは一定時間ごとに制御を返し、先読み中も操作が固まらないようにする。
@@ -571,41 +575,75 @@ export class Player {
 
     const clampedCenter = this.clampToPlaybackRange(center);
     const targetRadius = full ? this.stepRadius : this.immediateRadius;
-    const span = Math.max(this.frameDuration * targetRadius, 0.5);
-    const wantFrom = Math.max(this.playbackStart, clampedCenter - span);
-    const wantTo = Math.min(this.playbackEnd, clampedCenter + span);
     this.stepDecodingFrom = clampedCenter;
     this.stepDecodingTo = clampedCenter;
     try {
-      // 現在位置を含むキャッシュ済み連続区間の端を求め、その外側の不足分だけを取得する。
-      const aheadEdge = this.contiguousAheadEdge(clampedCenter);
-      const behindEdge = this.contiguousBehindEdge(clampedCenter);
-      // 前方の不足分 → 後方の不足分の順にデコード。
-      await this.decodeRangeInChunks(gen, aheadEdge, wantTo, 1);
-      if (gen !== this.stepGen) return;
-      await this.decodeRangeInChunks(gen, wantFrom, behindEdge, -1);
+      for (const radius of this.prefetchStageRadii(targetRadius)) {
+        if (gen !== this.stepGen) return;
+        const span = this.frameDuration * radius;
+        const from = Math.max(this.playbackStart, clampedCenter - span);
+        const to = Math.min(this.playbackEnd, clampedCenter + span);
+        await this.decodeStageAroundCenter(gen, clampedCenter, from, to);
+        await delay(0);
+      }
     } finally {
       if (gen === this.stepGen) this.stepDecoding = false;
     }
   }
 
-  private async decodeRangeInChunks(gen: number, from: number, to: number, dir: 1 | -1): Promise<void> {
-    from = Math.max(this.playbackStart, from);
-    to = Math.min(this.playbackEnd, to);
-    if (to - from <= this.frameDuration * 0.5) return;
+  private prefetchStageRadii(targetRadius: number): number[] {
+    const target = Math.max(1, Math.floor(targetRadius));
+    const first = Math.min(target, this.initialPrefetchRadius);
+    const radii = new Set<number>([first, target]);
 
-    if (dir > 0) {
-      for (let start = from; start < to && gen === this.stepGen; start += this.prefetchChunkSec) {
-        await this.decodeRange(gen, start, Math.min(to, start + this.prefetchChunkSec));
-        await delay(0);
+    if (target > first && this.stagedPrefetchPasses > 1) {
+      for (let pass = 1; pass < this.stagedPrefetchPasses - 1; pass++) {
+        radii.add(Math.round(first + ((target - first) * pass) / (this.stagedPrefetchPasses - 1)));
       }
-      return;
     }
 
-    for (let end = to; end > from && gen === this.stepGen; end -= this.prefetchChunkSec) {
-      const start = Math.max(from, end - this.prefetchChunkSec);
-      await this.decodeRange(gen, start, end);
-      await delay(0);
+    return [...radii].sort((a, b) => a - b);
+  }
+
+  private async decodeStageAroundCenter(gen: number, center: number, from: number, to: number): Promise<void> {
+    const minSpan = this.frameDuration * 0.5;
+    let aheadBlocked = false;
+    let behindBlocked = false;
+
+    while (gen === this.stepGen) {
+      let didWork = false;
+
+      if (!aheadBlocked) {
+        const aheadEdge = this.contiguousAheadEdge(center);
+        if (to - aheadEdge > minSpan) {
+          const chunkTo = Math.min(to, aheadEdge + this.prefetchChunkSec);
+          await this.decodeRange(gen, aheadEdge, chunkTo);
+          const nextAheadEdge = this.contiguousAheadEdge(center);
+          aheadBlocked = nextAheadEdge <= aheadEdge + minSpan;
+          didWork = true;
+          await delay(0);
+        } else {
+          aheadBlocked = true;
+        }
+      }
+
+      if (gen !== this.stepGen) return;
+
+      if (!behindBlocked) {
+        const behindEdge = this.contiguousBehindEdge(center);
+        if (behindEdge - from > minSpan) {
+          const chunkFrom = Math.max(from, behindEdge - this.prefetchChunkSec);
+          await this.decodeRange(gen, chunkFrom, behindEdge);
+          const nextBehindEdge = this.contiguousBehindEdge(center);
+          behindBlocked = nextBehindEdge >= behindEdge - minSpan;
+          didWork = true;
+          await delay(0);
+        } else {
+          behindBlocked = true;
+        }
+      }
+
+      if (!didWork || (aheadBlocked && behindBlocked)) return;
     }
   }
 
