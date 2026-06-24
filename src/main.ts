@@ -1,4 +1,5 @@
 import './style.css';
+import type { CopyExportPlan } from './export/clipExport';
 import { Player, type LoadedInfo, type RestoreState, type StepFrame } from './player/Player';
 import { Timeline, type TimelineThumbnail } from './ui/Timeline';
 import {
@@ -56,7 +57,25 @@ const setInBtn = $<HTMLButtonElement>('setIn');
 const setOutBtn = $<HTMLButtonElement>('setOut');
 const clearInOutBtn = $<HTMLButtonElement>('clearInOut');
 const loopBtn = $<HTMLButtonElement>('loopBtn');
+const exportClipBtn = $<HTMLButtonElement>('exportClipBtn');
 const volume = $<HTMLInputElement>('volume');
+const exportDialog = $<HTMLDivElement>('exportDialog');
+const exportCloseBtn = $<HTMLButtonElement>('exportCloseBtn');
+const exportCancelBtn = $<HTMLButtonElement>('exportCancelBtn');
+const exportStartBtn = $<HTMLButtonElement>('exportStartBtn');
+const exportTargetSize = $<HTMLSelectElement>('exportTargetSize');
+const exportCopyOption = (() => {
+  const el = exportTargetSize.querySelector<HTMLOptionElement>('option[value="copy"]');
+  if (!el) throw new Error('#exportTargetSize copy option not found');
+  return el;
+})();
+const exportRange = $<HTMLElement>('exportRange');
+const exportDuration = $<HTMLElement>('exportDuration');
+const exportFormat = $<HTMLElement>('exportFormat');
+const exportGeometry = $<HTMLElement>('exportGeometry');
+const exportEstimate = $<HTMLElement>('exportEstimate');
+const exportBitrates = $<HTMLElement>('exportBitrates');
+const exportStatus = $<HTMLDivElement>('exportStatus');
 
 const controlButtons = [
   playPauseBtn,
@@ -66,6 +85,7 @@ const controlButtons = [
   setOutBtn,
   clearInOutBtn,
   loopBtn,
+  exportClipBtn,
 ];
 
 let currentHandle: FileSystemFileHandle | null = null;
@@ -92,12 +112,20 @@ let hoverTime: number | null = null;
 let hoverClientX = 0;
 let hoverClientY = 0;
 let hoverRequestRunning = false;
+let exportRunning = false;
+let exportAbortController: AbortController | null = null;
+let exportCopyCheckGen = 0;
 
 const timelineThumbWidth = 96;
 const timelineThumbHeight = 54;
 const timelineThumbCacheLimit = 180;
 const previewThumbWidth = 180;
 const previewThumbHeight = 102;
+const exportAudioBitrateMax = 192_000;
+const exportAudioBitrateMin = 96_000;
+const exportAudioBitrateShare = 0.12;
+const exportAacBitrates = [96_000, 128_000, 160_000, 192_000] as const;
+const exportVideoBitrateMin = 150_000;
 
 interface ThumbnailJob {
   key: string;
@@ -112,6 +140,52 @@ function fmt(t: number): string {
   const s = Math.floor(t % 60);
   const ms = Math.floor((t - Math.floor(t)) * 1000);
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(ms).padStart(3, '0')}`;
+}
+
+function fmtBytes(bytes: number): string {
+  if (!isFinite(bytes) || bytes <= 0) return '0 MB';
+  const mb = bytes / (1024 * 1024);
+  if (mb < 1000) return `${mb.toFixed(mb < 10 ? 1 : 0)} MB`;
+  return `${(mb / 1024).toFixed(2)} GB`;
+}
+
+function fmtBitrate(bitsPerSecond: number): string {
+  if (!isFinite(bitsPerSecond) || bitsPerSecond <= 0) return '0 kbps';
+  if (bitsPerSecond >= 1_000_000) return `${(bitsPerSecond / 1_000_000).toFixed(2)} Mbps`;
+  return `${Math.round(bitsPerSecond / 1000)} kbps`;
+}
+
+function wantsCopyExport(): boolean {
+  return exportTargetSize.value === 'copy';
+}
+
+function nearestAacBitrate(bitsPerSecond: number): number {
+  return exportAacBitrates.reduce((prev, curr) =>
+    Math.abs(curr - bitsPerSecond) < Math.abs(prev - bitsPerSecond) ? curr : prev,
+  );
+}
+
+function hasExportRange(): boolean {
+  if (!player.loaded || !info) return false;
+  const s = player.getState();
+  return s.inPointSet === true && s.outPointSet === true && player.outPoint > player.inPoint + Math.max(player.frameDuration, 1e-3);
+}
+
+function exportPlan(bitrateScale: number): { videoBitrate: number; audioBitrate: number; estimatedBytes: number; duration: number } {
+  const duration = Math.max(0, player.outPoint - player.inPoint);
+  const sourceBytes = currentFile?.size ?? 0;
+  const sourceDuration = Math.max(info?.duration ?? duration, 1e-3);
+  const sourceBitrate = Math.max(1, Math.floor((sourceBytes * 8) / sourceDuration));
+  const totalBitrate = Math.floor(sourceBitrate * bitrateScale);
+  const sourceAudioBitrate = Math.floor(sourceBitrate * exportAudioBitrateShare);
+  const audioBitrate = info?.hasAudio
+    ? nearestAacBitrate(
+        Math.min(exportAudioBitrateMax, Math.max(exportAudioBitrateMin, sourceAudioBitrate)),
+      )
+    : 0;
+  const videoBitrate = Math.floor(totalBitrate - audioBitrate);
+  const estimatedBytes = Math.round(((videoBitrate + audioBitrate) * duration) / 8);
+  return { videoBitrate, audioBitrate, estimatedBytes, duration };
 }
 
 function frameNumber(t: number): number {
@@ -385,6 +459,243 @@ function setControlsEnabled(on: boolean): void {
   for (const b of controlButtons) b.disabled = !on;
 }
 
+function setExportStatus(message: string, isError = false): void {
+  exportStatus.textContent = message;
+  exportStatus.classList.toggle('error-text', isError);
+}
+
+function updateExportAvailability(): void {
+  exportClipBtn.disabled = exportRunning || !hasExportRange();
+}
+
+function updateExportDialog(): void {
+  if (!info || !hasExportRange()) {
+    exportRange.textContent = 'No In/Out range';
+    exportDuration.textContent = '00:00.000';
+    exportEstimate.textContent = 'Estimated 0 MB';
+    exportBitrates.textContent = 'Video 0 kbps / Audio 0 kbps';
+    exportStartBtn.disabled = true;
+    return;
+  }
+
+  const copyMode = wantsCopyExport();
+  const bitrateScale = copyMode ? 1 : Number(exportTargetSize.value);
+  exportRange.textContent = `${fmt(player.inPoint)} - ${fmt(player.outPoint)}`;
+  exportDuration.textContent = fmt(Math.max(0, player.outPoint - player.inPoint));
+  exportFormat.textContent = copyMode
+    ? 'MP4 / Source packets'
+    : info.hasAudio ? 'MP4 / H.264 / AAC' : 'MP4 / H.264';
+  exportGeometry.textContent = `${info.width}x${info.height} / ${info.fps.toFixed(2)}fps`;
+  exportTargetSize.disabled = exportRunning;
+
+  if (copyMode) {
+    const duration = Math.max(0, player.outPoint - player.inPoint);
+    const sourceDuration = Math.max(info.duration, 1e-3);
+    const sourceBitrate = Math.max(1, Math.floor(((currentFile?.size ?? 0) * 8) / sourceDuration));
+    exportEstimate.textContent = `Estimated ${fmtBytes(Math.round((sourceBitrate * duration) / 8))} before range adjustment`;
+    exportBitrates.textContent = 'No recompression. Frame range may expand. / 再圧縮なし。フレーム範囲が広がる場合があります。';
+  } else {
+    const plan = exportPlan(bitrateScale);
+    exportEstimate.textContent = `Estimated ${fmtBytes(plan.estimatedBytes)} (video ${bitrateScale.toFixed(0)}x, audio 1x)`;
+    exportBitrates.textContent = info.hasAudio
+      ? `Video ${fmtBitrate(plan.videoBitrate)} / Audio ${fmtBitrate(plan.audioBitrate)}`
+      : `Video ${fmtBitrate(plan.videoBitrate)}`;
+  }
+
+  const plan = copyMode ? null : exportPlan(bitrateScale);
+  const invalid = copyMode
+    ? ''
+    : info.width % 2 !== 0 || info.height % 2 !== 0
+      ? 'H.264 export requires even source dimensions.'
+      : plan && plan.videoBitrate < exportVideoBitrateMin
+        ? `Target is too small. Video bitrate would be ${fmtBitrate(plan.videoBitrate)}.`
+        : '';
+  setExportStatus(invalid, invalid !== '');
+  exportStartBtn.disabled = exportRunning || invalid !== '';
+}
+
+function openExportDialog(): void {
+  if (!hasExportRange()) return;
+  updateExportDialog();
+  exportDialog.hidden = false;
+  exportTargetSize.focus();
+  void refreshExportCopyOption();
+}
+
+function closeExportDialog(): void {
+  if (exportRunning) return;
+  exportDialog.hidden = true;
+  setExportStatus('');
+}
+
+function setExportRunning(on: boolean): void {
+  exportRunning = on;
+  exportCancelBtn.textContent = on ? 'Cancel' : 'Close';
+  exportCancelBtn.disabled = false;
+  exportCloseBtn.disabled = on;
+  exportTargetSize.disabled = on;
+  setControlsEnabled(player.loaded && !on);
+  updateExportAvailability();
+  if (!exportDialog.hidden) updateExportDialog();
+}
+
+async function refreshExportCopyOption(): Promise<void> {
+  if (!currentFile || !info || !hasExportRange()) return;
+  const gen = ++exportCopyCheckGen;
+  const selectedWasCopy = wantsCopyExport();
+  exportCopyOption.disabled = true;
+
+  try {
+    const { analyzeCopyMp4Export } = await import('./export/clipExport');
+    const plan = await analyzeCopyMp4Export({
+      file: currentFile,
+      info,
+      inPoint: player.inPoint,
+      outPoint: player.outPoint,
+    });
+    if (gen !== exportCopyCheckGen) return;
+
+    exportCopyOption.disabled = !plan.canCopy;
+    exportCopyOption.title = plan.canCopy
+      ? `Copy ${plan.videoCodec}${plan.audioCodec ? ` / ${plan.audioCodec}` : ''} packets`
+      : plan.reason ?? 'This file cannot be copied without recompression.';
+    if (!plan.canCopy && selectedWasCopy) {
+      exportTargetSize.value = '1';
+      updateExportDialog();
+      setExportStatus(exportCopyOption.title, true);
+    }
+  } catch (e) {
+    if (gen !== exportCopyCheckGen) return;
+    exportCopyOption.disabled = true;
+    exportCopyOption.title = e instanceof Error ? e.message : String(e);
+    if (selectedWasCopy) {
+      exportTargetSize.value = '1';
+      updateExportDialog();
+      setExportStatus(exportCopyOption.title, true);
+    }
+  }
+}
+
+function downloadBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+async function runExport(): Promise<void> {
+  if (exportRunning || !currentFile || !info || !hasExportRange()) return;
+  const controller = new AbortController();
+  exportAbortController = controller;
+
+  const compressionMode = wantsCopyExport() ? 'copy' : 'reencode';
+  const bitrateScale = compressionMode === 'copy' ? 1 : Number(exportTargetSize.value);
+  setExportRunning(true);
+  exportStartBtn.disabled = true;
+  exportClipBtn.disabled = true;
+  setExportStatus('Preparing export...');
+  let preparedForExport = false;
+
+  try {
+    const { analyzeCopyMp4Export, exportMp4Clip } = await import('./export/clipExport');
+    let copyPlan: CopyExportPlan | undefined;
+
+    if (compressionMode === 'copy') {
+      setExportStatus('Checking source packets...');
+      copyPlan = await analyzeCopyMp4Export({
+        file: currentFile,
+        info,
+        inPoint: player.inPoint,
+        outPoint: player.outPoint,
+        signal: controller.signal,
+      });
+      if (!copyPlan.canCopy) {
+        throw new Error(copyPlan.reason ?? 'This file cannot be copied without recompression.');
+      }
+      if (copyPlan.adjusted) {
+        const beforeFrames = Math.max(0, Math.round((copyPlan.requestedInPoint - copyPlan.inPoint) * info.fps));
+        const afterFrames = Math.max(0, Math.round((copyPlan.outPoint - copyPlan.requestedOutPoint) * info.fps));
+        const ok = window.confirm(
+          [
+            'No recompression keeps original quality, but can only cut at keyframes.',
+            '「No recompression」は元の品質を保ちますが、キーフレーム位置でしかカットできません。',
+            '',
+            `Added frames: before ${beforeFrames}, after ${afterFrames}.`,
+            `追加フレーム: 前 ${beforeFrames}、後ろ ${afterFrames}。`,
+            '',
+            'Choose Compression ×1 or ×2 for the exact selected range.',
+            '選択範囲ぴったりで書き出す場合は「Compression ×1」または「Compression ×2」を選んでください。',
+            '',
+            'Continue?',
+            '続行しますか？',
+          ].join('\n'),
+        );
+        if (!ok) {
+          setExportStatus('Export canceled.');
+          return;
+        }
+      }
+    }
+
+    player.prepareForHeavyWork();
+    resetTimelineThumbnails();
+    pauseTimelineThumbnailWork(2000);
+    preparedForExport = true;
+
+    const result = await exportMp4Clip({
+      file: currentFile,
+      info,
+      inPoint: player.inPoint,
+      outPoint: player.outPoint,
+      bitrateScale,
+      compressionMode,
+      copyPlan,
+      signal: controller.signal,
+      onProgress(progress) {
+        const pct = Math.max(0, Math.min(99, Math.floor(progress * 100)));
+        setExportStatus(`${compressionMode === 'copy' ? 'Copying packets' : 'Exporting'}... ${pct}%`);
+      },
+    });
+    downloadBlob(result.blob, result.filename);
+    const rangeNote = result.actualInPoint !== player.inPoint || result.actualOutPoint !== player.outPoint
+      ? ` Range ${fmt(result.actualInPoint)} - ${fmt(result.actualOutPoint)}.`
+      : '';
+    setExportStatus(`Done. ${fmtBytes(result.blob.size)} saved.${rangeNote}`);
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'AbortError') {
+      setExportStatus('Export canceled.');
+    } else {
+      setExportStatus(e instanceof Error ? e.message : String(e), true);
+    }
+  } finally {
+    const statusText = exportStatus.textContent ?? '';
+    const statusIsError = exportStatus.classList.contains('error-text');
+    exportAbortController = null;
+    setExportRunning(false);
+    updateExportDialog();
+    if (statusText) setExportStatus(statusText, statusIsError);
+    updateExportAvailability();
+    if (preparedForExport) {
+      resumeTimelineThumbnailWork(600);
+      if (player.loaded) void player.seek(player.currentTime);
+    }
+  }
+}
+
+function requestExportCancel(): void {
+  if (!exportRunning) {
+    closeExportDialog();
+    return;
+  }
+  exportCancelBtn.disabled = true;
+  setExportStatus('Canceling export...');
+  exportAbortController?.abort();
+}
+
 function isShortcutInputTarget(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null;
   if (!el) return false;
@@ -564,6 +875,7 @@ const player = new Player(canvas, {
     dropHint.hidden = true;
     resumeBtn.hidden = true;
     setControlsEnabled(true);
+    updateExportAvailability();
     scheduleTimelineThumbnails(true);
   },
   onTime(t) {
@@ -582,6 +894,11 @@ const player = new Player(canvas, {
     loopBtn.textContent = `Loop: ${loop ? 'ON' : 'OFF'}`;
     const full = inP <= 0 && info != null && Math.abs(outP - info.duration) < 1e-3;
     inOutLabel.textContent = full ? '' : `In ${fmt(inP)} / Out ${fmt(outP)}`;
+    updateExportAvailability();
+    if (!exportDialog.hidden) {
+      updateExportDialog();
+      void refreshExportCopyOption();
+    }
   },
   onError(msg) {
     showError(msg);
@@ -590,18 +907,22 @@ const player = new Player(canvas, {
 
 const timeline = new Timeline(timelineCanvas, {
   onSeek: (t) => {
+    if (exportRunning) return;
     pauseTimelineThumbnailWork(700);
     void player.seek(t);
   },
   onSetIn: (t) => {
+    if (exportRunning) return;
     pauseTimelineThumbnailWork(450);
     player.setIn(t);
   },
   onSetOut: (t) => {
+    if (exportRunning) return;
     pauseTimelineThumbnailWork(450);
     player.setOut(t);
   },
   onHover: (t, x, y) => {
+    if (exportRunning) return;
     if (t === null) hideTimelinePreview();
     else showTimelinePreview(t, x, y);
   },
@@ -672,14 +993,14 @@ stage.addEventListener('dragleave', () => stage.classList.remove('dragover'));
 stage.addEventListener('drop', (e) => void onDrop(e));
 
 stage.addEventListener('wheel', (e) => {
-  if (!player.loaded) return;
+  if (!player.loaded || exportRunning) return;
   e.preventDefault();
   const factor = Math.exp(-e.deltaY * 0.001);
   setVideoScale(videoScale * factor, e.clientX, e.clientY);
 }, { passive: false });
 
 stage.addEventListener('pointerdown', (e) => {
-  if (!player.loaded || e.button !== 0) return;
+  if (!player.loaded || exportRunning || e.button !== 0) return;
   if (isInteractiveTarget(e.target)) return;
   stageDrag = { pointerId: e.pointerId, x: e.clientX, y: e.clientY };
   stage.setPointerCapture(e.pointerId);
@@ -721,6 +1042,7 @@ window.addEventListener('resize', () => {
 async function onDrop(e: DragEvent): Promise<void> {
   e.preventDefault();
   stage.classList.remove('dragover');
+  if (exportRunning) return;
   const dt = e.dataTransfer;
   if (!dt) return;
 
@@ -733,7 +1055,13 @@ async function onDrop(e: DragEvent): Promise<void> {
 }
 
 window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !exportDialog.hidden && !exportCloseBtn.disabled) {
+    e.preventDefault();
+    closeExportDialog();
+    return;
+  }
   if (!player.loaded) return;
+  if (exportRunning) return;
   if (isShortcutInputTarget(e.target)) return;
 
   switch (e.key) {
@@ -799,6 +1127,14 @@ clearInOutBtn.addEventListener('click', () => {
   player.clearInOut();
 });
 loopBtn.addEventListener('click', () => player.toggleLoop());
+exportClipBtn.addEventListener('click', () => openExportDialog());
+exportTargetSize.addEventListener('change', () => updateExportDialog());
+exportStartBtn.addEventListener('click', () => void runExport());
+exportCloseBtn.addEventListener('click', () => closeExportDialog());
+exportCancelBtn.addEventListener('click', () => requestExportCancel());
+exportDialog.addEventListener('click', (e) => {
+  if (e.target === exportDialog && !exportCloseBtn.disabled) closeExportDialog();
+});
 volume.addEventListener('input', () => player.setVolume(parseFloat(volume.value)));
 viewFitBtn.addEventListener('click', () => fitVideoToStage());
 viewScale.addEventListener('change', () => {

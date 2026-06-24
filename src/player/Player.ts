@@ -93,6 +93,7 @@ export class Player {
   private inPointSet = false;
   private outPointSet = false;
   private volume = 1;
+  private workGen = 0;
   private stepGen = 0;
   private stepDecoding = false;
   private stepDecodingFrom = 0;
@@ -395,6 +396,9 @@ export class Player {
 
   async seek(time: number, keepPlaying = false): Promise<void> {
     if (!this.loaded) return;
+    this.workGen++;
+    this.stepGen++;
+    this.stepDecoding = false;
     this.pendingSeekTime = this.clampToPlaybackRange(time);
     if (this.seekRunning) return;
 
@@ -458,10 +462,12 @@ export class Player {
     }
   }
 
-  private async stepOnce(dir: 1 | -1): Promise<boolean> {
+  private async stepOnce(dir: 1 | -1, workGen = this.workGen): Promise<boolean> {
+    if (workGen !== this.workGen) return false;
     if (dir > 0 && this.currentTime >= this.playbackEnd - this.eps) {
       if (!this.hasPlaybackRange) return false;
-      await this.drawAt(this.playbackStart);
+      await this.drawAt(this.playbackStart, workGen);
+      if (workGen !== this.workGen) return false;
       this.currentTime = this.playbackStart;
       this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
       this.callbacks.onTime(this.currentTime);
@@ -470,7 +476,8 @@ export class Player {
     }
     if (dir < 0 && this.currentTime <= this.playbackStart + this.eps) {
       if (!this.hasPlaybackRange) {
-        await this.drawAt(this.playbackStart);
+        await this.drawAt(this.playbackStart, workGen);
+        if (workGen !== this.workGen) return false;
         this.currentTime = this.playbackStart;
         this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
         this.callbacks.onTime(this.currentTime);
@@ -483,7 +490,8 @@ export class Player {
         this.blitStepFrame(frame);
         this.currentTime = this.clampToPlaybackRange(frame.time);
       } else {
-        await this.drawAt(this.playbackEnd);
+        await this.drawAt(this.playbackEnd, workGen);
+        if (workGen !== this.workGen) return false;
         this.currentTime = this.playbackEnd;
       }
       this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
@@ -495,6 +503,7 @@ export class Player {
     let frame = dir > 0 ? this.nextCachedFrame(this.currentTime) : this.prevCachedFrame(this.currentTime);
     if (!frame) {
       await this.ensureStepFrame(this.currentTime, dir);
+      if (workGen !== this.workGen) return false;
       frame = dir > 0 ? this.nextCachedFrame(this.currentTime) : this.prevCachedFrame(this.currentTime);
     }
     if (!frame) {
@@ -526,6 +535,17 @@ export class Player {
     }
 
     void this.prefetchStepWindow(this.currentTime);
+  }
+
+  prepareForHeavyWork(): void {
+    this.pendingStepDelta = 0;
+    this.workGen++;
+    this.stepGen++;
+    this.stepDecoding = false;
+    this.stepDecodingFrom = 0;
+    this.stepDecodingTo = 0;
+    this.stopPlaybackSideEffects(true);
+    this.clearStepFrames();
   }
 
   private async ensureStepFrame(center: number, dir: 1 | -1): Promise<void> {
@@ -787,6 +807,11 @@ export class Player {
     }
   }
 
+  private clearStepFrames(): void {
+    this.stepFrames.clear();
+    this.stepKeys = [];
+  }
+
   private nextCachedFrame(time: number): StepFrame | null {
     const key = this.frameKey(time + 1e-6);
     for (const k of this.stepKeys) {
@@ -822,8 +847,7 @@ export class Player {
     this.asyncId++;
     const id = this.asyncId;
     this.nextFrame = null;
-    await this.videoIterator?.return(undefined);
-    this.videoIterator = null;
+    await this.stopVideoIterator();
     if (!this.videoSink) return;
 
     this.videoIterator = this.videoSink.canvases(this.toMediaTime(this.currentTime), this.toMediaTime(this.playbackEnd));
@@ -842,9 +866,10 @@ export class Player {
     }
   }
 
-  private async drawAt(time: number): Promise<void> {
+  private async drawAt(time: number, workGen = this.workGen): Promise<void> {
     if (!this.videoSink) return;
     const frame = await this.videoSink.getCanvas(this.toMediaTime(time));
+    if (workGen !== this.workGen) return;
     if (frame) this.blitStepFrame(this.storeWrappedCanvas(frame));
   }
 
@@ -912,9 +937,14 @@ export class Player {
   }
 
   private async stopVideoIterator(): Promise<void> {
-    await this.videoIterator?.return(undefined);
+    const iterator = this.videoIterator;
     this.videoIterator = null;
     this.nextFrame = null;
+    try {
+      await iterator?.return(undefined);
+    } catch {
+      // Iterator cancellation during seek/dispose is expected.
+    }
   }
 
   private toMediaTime(time: number): number {
@@ -1070,6 +1100,7 @@ export class Player {
   }
 
   async dispose(): Promise<void> {
+    this.workGen++;
     this.stopPlaybackSideEffects();
     await this.videoIterator?.return(undefined);
     this.videoIterator = null;
@@ -1085,8 +1116,7 @@ export class Player {
     this.audioSink = null;
     this.videoSink = null;
     this.thumbnailSink = null;
-    this.stepFrames.clear();
-    this.stepKeys = [];
+    this.clearStepFrames();
     this.stepDecoding = false;
     this.stepDecodingFrom = 0;
     this.stepDecodingTo = 0;

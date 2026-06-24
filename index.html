@@ -65,6 +65,7 @@
           <button id="setOut" title="Set Out at current time (O)">Set Out</button>
           <button id="clearInOut" title="Clear In/Out">Clear In/Out</button>
           <button id="loopBtn" title="Loop on/off (L)">Loop: OFF</button>
+          <button id="exportClipBtn" title="Export In/Out as MP4" disabled>Export</button>
 
           <span class="spacer"></span>
 
@@ -98,6 +99,42 @@
 
         <button id="closeUiBtn" class="collapse-ui-btn" title="Hide controls" aria-label="Hide controls">▼</button>
       </section>
+
+      <div id="exportDialog" class="modal-backdrop" hidden>
+        <section class="export-modal" role="dialog" aria-modal="true" aria-labelledby="exportTitle">
+          <header class="export-modal-head">
+            <h2 id="exportTitle">Export MP4</h2>
+            <button id="exportCloseBtn" class="icon-btn" title="Close export dialog" aria-label="Close export dialog">×</button>
+          </header>
+          <div class="export-grid">
+            <span>Range</span>
+            <strong id="exportRange">00:00.000 - 00:00.000</strong>
+            <span>Duration</span>
+            <strong id="exportDuration">00:00.000</strong>
+            <span>Output</span>
+            <strong id="exportFormat">MP4 / H.264 / AAC</strong>
+            <span>Size</span>
+            <strong id="exportGeometry">0x0 / 0.00fps</strong>
+          </div>
+          <label class="export-target">
+            Compression
+            <select id="exportTargetSize">
+              <option value="1" selected>Compression ×1</option>
+              <option value="2">Compression ×2</option>
+              <option value="copy">No recompression.</option>
+            </select>
+          </label>
+          <div class="export-plan">
+            <span id="exportEstimate">Estimated 0 MB</span>
+            <span id="exportBitrates">Video 0 Mbps / Audio 0 kbps</span>
+          </div>
+          <div id="exportStatus" class="export-status" aria-live="polite"></div>
+          <div class="export-actions">
+            <button id="exportStartBtn">Export MP4</button>
+            <button id="exportCancelBtn">Close</button>
+          </div>
+        </section>
+      </div>
     </div>
 
     <script type="module" src="/src/main.ts"></script>
