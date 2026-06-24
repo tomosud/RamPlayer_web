@@ -121,6 +121,7 @@ let hoverRequestRunning = false;
 let exportRunning = false;
 let exportAbortController: AbortController | null = null;
 let exportCopyCheckGen = 0;
+let showUiIdleTimer = 0;
 
 const timelineThumbWidth = 96;
 const timelineThumbHeight = 54;
@@ -816,9 +817,28 @@ function openScaleContextMenu(clientX: number, clientY: number): void {
 function resetLayout(): void {
   topbar.hidden = false;
   app.classList.remove('chrome-hidden');
+  stage.classList.remove('cursor-idle');
   floatingUi.hidden = false;
   showUiBtn.hidden = true;
+  showUiBtn.classList.remove('is-idle');
   fitVideoToStage();
+}
+
+function scheduleShowUiIdleFade(): void {
+  window.clearTimeout(showUiIdleTimer);
+  showUiIdleTimer = window.setTimeout(() => {
+    if (!showUiBtn.hidden && app.classList.contains('chrome-hidden')) {
+      showUiBtn.classList.add('is-idle');
+      stage.classList.add('cursor-idle');
+    }
+  }, 3000);
+}
+
+function revealShowUiButton(): void {
+  if (showUiBtn.hidden || !app.classList.contains('chrome-hidden')) return;
+  showUiBtn.classList.remove('is-idle');
+  stage.classList.remove('cursor-idle');
+  scheduleShowUiIdleFade();
 }
 
 function updateMediaInfo(): void {
@@ -1327,6 +1347,9 @@ closeUiBtn.addEventListener('click', () => {
   app.classList.add('chrome-hidden');
   floatingUi.hidden = true;
   showUiBtn.hidden = false;
+  showUiBtn.classList.remove('is-idle');
+  stage.classList.remove('cursor-idle');
+  scheduleShowUiIdleFade();
 });
 showUiBtn.addEventListener('click', () => {
   blurControl(showUiBtn);
@@ -1334,7 +1357,11 @@ showUiBtn.addEventListener('click', () => {
   app.classList.remove('chrome-hidden');
   floatingUi.hidden = false;
   showUiBtn.hidden = true;
+  showUiBtn.classList.remove('is-idle');
+  stage.classList.remove('cursor-idle');
+  window.clearTimeout(showUiIdleTimer);
 });
+window.addEventListener('pointermove', () => revealShowUiButton());
 
 resumeBtn.addEventListener('click', () => {
   blurControl(resumeBtn);

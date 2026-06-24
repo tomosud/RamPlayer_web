@@ -113,6 +113,7 @@ body {
 }
 
 .stage.is-panning { cursor: grabbing; }
+.chrome-hidden .stage.cursor-idle { cursor: none; }
 .stage.dragover { outline: 2px dashed var(--accent); outline-offset: -12px; }
 
 #canvas {
@@ -225,6 +226,13 @@ body {
   border: 1px solid var(--border);
   color: var(--text);
   backdrop-filter: blur(10px);
+  transition: opacity 180ms ease, transform 180ms ease;
+}
+
+.show-ui-btn.is-idle {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(6px);
 }
 
 .info-row,
