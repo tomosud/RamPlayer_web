@@ -469,17 +469,11 @@ export class Player {
   private async stepOnce(dir: 1 | -1, workGen = this.workGen): Promise<boolean> {
     if (workGen !== this.workGen) return false;
     if (dir > 0 && this.currentTime >= this.playbackEnd - this.eps) {
-      if (!this.hasPlaybackRange) return false;
-      await this.drawAt(this.playbackStart, workGen);
-      if (workGen !== this.workGen) return false;
-      this.currentTime = this.playbackStart;
-      this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
-      this.callbacks.onTime(this.currentTime);
-      this.scheduleStepPrefetch(this.currentTime);
-      return true;
+      if (!this.loop) return false;
+      return this.stepAcrossLoopBoundary(1, workGen);
     }
     if (dir < 0 && this.currentTime <= this.playbackStart + this.eps) {
-      if (!this.hasPlaybackRange) {
+      if (!this.loop) {
         await this.drawAt(this.playbackStart, workGen);
         if (workGen !== this.workGen) return false;
         this.currentTime = this.playbackStart;
@@ -488,8 +482,48 @@ export class Player {
         this.scheduleStepPrefetch(this.currentTime);
         return false;
       }
+      return this.stepAcrossLoopBoundary(-1, workGen);
+    }
+
+    let frame = dir > 0 ? this.nextAdjacentCachedFrame(this.currentTime) : this.prevAdjacentCachedFrame(this.currentTime);
+    if (!frame) {
+      await this.ensureStepFrame(this.currentTime, dir);
+      if (workGen !== this.workGen) return false;
+      frame = dir > 0 ? this.nextAdjacentCachedFrame(this.currentTime) : this.prevAdjacentCachedFrame(this.currentTime);
+    }
+    if (!frame) {
+      if (this.loop && this.isAtLoopBoundary(dir)) {
+        return this.stepAcrossLoopBoundary(dir, workGen);
+      }
+      this.scheduleStepPrefetch(this.currentTime);
+      return false;
+    }
+
+    this.blitStepFrame(frame);
+    this.currentTime = this.clampToPlaybackRange(frame.time);
+    this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
+    this.callbacks.onTime(this.currentTime);
+    this.scheduleStepPrefetch(this.currentTime);
+    return true;
+  }
+
+  private async stepAcrossLoopBoundary(dir: 1 | -1, workGen: number): Promise<boolean> {
+    if (dir > 0) {
+      await this.ensureStepFrame(this.playbackStart, 1);
+      if (workGen !== this.workGen) return false;
+      const frame = this.cachedFrameAtOrAfter(this.playbackStart);
+      if (frame && frame.time <= this.playbackStart + this.stepContinuityGap) {
+        this.blitStepFrame(frame);
+        this.currentTime = this.clampToPlaybackRange(frame.time);
+      } else {
+        await this.drawAt(this.playbackStart, workGen);
+        if (workGen !== this.workGen) return false;
+        this.currentTime = this.playbackStart;
+      }
+    } else {
       await this.ensureStepFrame(this.playbackEnd, -1);
-      const frame = this.prevCachedFrame(this.playbackEnd);
+      if (workGen !== this.workGen) return false;
+      const frame = this.prevAdjacentCachedFrame(this.playbackEnd);
       if (frame && frame.time >= this.playbackStart - this.eps) {
         this.blitStepFrame(frame);
         this.currentTime = this.clampToPlaybackRange(frame.time);
@@ -498,25 +532,8 @@ export class Player {
         if (workGen !== this.workGen) return false;
         this.currentTime = this.playbackEnd;
       }
-      this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
-      this.callbacks.onTime(this.currentTime);
-      this.scheduleStepPrefetch(this.currentTime);
-      return true;
     }
 
-    let frame = dir > 0 ? this.nextCachedFrame(this.currentTime) : this.prevCachedFrame(this.currentTime);
-    if (!frame) {
-      await this.ensureStepFrame(this.currentTime, dir);
-      if (workGen !== this.workGen) return false;
-      frame = dir > 0 ? this.nextCachedFrame(this.currentTime) : this.prevCachedFrame(this.currentTime);
-    }
-    if (!frame) {
-      this.scheduleStepPrefetch(this.currentTime);
-      return false;
-    }
-
-    this.blitStepFrame(frame);
-    this.currentTime = this.clampToPlaybackRange(frame.time);
     this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
     this.callbacks.onTime(this.currentTime);
     this.scheduleStepPrefetch(this.currentTime);
@@ -601,6 +618,7 @@ export class Player {
     const targetRadius = full ? this.stepRadius : this.immediateRadius;
     this.stepDecodingFrom = clampedCenter;
     this.stepDecodingTo = clampedCenter;
+    let loopBoundaryPrefetched = false;
     try {
       for (const radius of this.prefetchStageRadii(targetRadius)) {
         if (gen !== this.stepGen) return;
@@ -608,10 +626,30 @@ export class Player {
         const from = Math.max(this.playbackStart, clampedCenter - span);
         const to = Math.min(this.playbackEnd, clampedCenter + span);
         await this.decodeStageAroundCenter(gen, clampedCenter, from, to);
+        if (!loopBoundaryPrefetched) {
+          loopBoundaryPrefetched = true;
+          await this.prefetchLoopBoundary(gen, clampedCenter);
+        }
         await delay(0);
       }
+      if (!loopBoundaryPrefetched) await this.prefetchLoopBoundary(gen, clampedCenter);
     } finally {
       if (gen === this.stepGen) this.stepDecoding = false;
+    }
+  }
+
+  private async prefetchLoopBoundary(gen: number, center: number): Promise<void> {
+    if (!this.loop || gen !== this.stepGen) return;
+    const span = Math.max(this.frameDuration * (this.immediateRadius + 2), 0.25);
+
+    if (this.playbackEnd - center <= span) {
+      await this.decodeRange(gen, this.playbackStart, Math.min(this.playbackEnd, this.playbackStart + span), false);
+      await delay(0);
+    }
+    if (gen !== this.stepGen) return;
+
+    if (center - this.playbackStart <= span) {
+      await this.decodeRange(gen, Math.max(this.playbackStart, this.playbackEnd - span), this.playbackEnd, false);
     }
   }
 
@@ -676,13 +714,13 @@ export class Player {
    * - 既にキャッシュ済みのフレームはコピーを作らずスキップ（再取得コストを抑える）。
    * - 6ms ごとに `await delay(0)` で制御を返し、入力・描画をブロックしない。
    */
-  private async decodeRange(gen: number, from: number, to: number): Promise<void> {
+  private async decodeRange(gen: number, from: number, to: number, trackRange = true): Promise<void> {
     if (!this.videoSink) return;
     from = Math.max(this.playbackStart, from);
     to = Math.min(this.playbackEnd, to);
     if (to - from <= this.frameDuration * 0.5) return;
 
-    this.stepDecodingFrom = Math.min(this.stepDecodingFrom, from);
+    if (trackRange) this.stepDecodingFrom = Math.min(this.stepDecodingFrom, from);
     const it = this.videoSink.canvases(this.toMediaTime(from), this.toMediaTime(to));
     let mark = performance.now();
     let addedSinceEvict = 0;
@@ -695,10 +733,10 @@ export class Player {
         const key = this.frameKey(t);
         if (this.stepFrames.has(key)) {
           // 既読フレームはデコードのみ進み、コピー・退避は行わない。
-          this.stepDecodingTo = Math.max(this.stepDecodingTo, t + frame.duration);
+          if (trackRange) this.stepDecodingTo = Math.max(this.stepDecodingTo, t + frame.duration);
         } else {
           const cached = this.storeWrappedCanvas(frame);
-          this.stepDecodingTo = Math.max(this.stepDecodingTo, cached.time + cached.duration);
+          if (trackRange) this.stepDecodingTo = Math.max(this.stepDecodingTo, cached.time + cached.duration);
           addedSinceEvict++;
         }
         if (performance.now() - mark > 6) {
@@ -721,23 +759,21 @@ export class Player {
 
   /** center を含むキャッシュ済み連続区間の上端時刻（無ければ center）。 */
   private contiguousAheadEdge(center: number): number {
-    const gap = Math.max(this.frameDuration * 1.8, 0.08);
     let t = center;
     for (;;) {
       const f = this.nextCachedFrame(t);
-      if (!f || f.time - t > gap) break;
+      if (!f || f.time - t > this.stepContinuityGap) break;
       t = f.time;
     }
     return t;
   }
 
   private contiguousFramesAhead(center: number): number {
-    const gap = Math.max(this.frameDuration * 1.8, 0.08);
     let t = center;
     let count = 0;
     for (;;) {
       const f = this.nextCachedFrame(t);
-      if (!f || f.time - t > gap) break;
+      if (!f || f.time - t > this.stepContinuityGap) break;
       t = f.time;
       count++;
     }
@@ -746,23 +782,21 @@ export class Player {
 
   /** center を含むキャッシュ済み連続区間の下端時刻（無ければ center）。 */
   private contiguousBehindEdge(center: number): number {
-    const gap = Math.max(this.frameDuration * 1.8, 0.08);
     let t = center;
     for (;;) {
       const f = this.prevCachedFrame(t);
-      if (!f || t - f.time > gap) break;
+      if (!f || t - f.time > this.stepContinuityGap) break;
       t = f.time;
     }
     return t;
   }
 
   private contiguousFramesBehind(center: number): number {
-    const gap = Math.max(this.frameDuration * 1.8, 0.08);
     let t = center;
     let count = 0;
     for (;;) {
       const f = this.prevCachedFrame(t);
-      if (!f || t - f.time > gap) break;
+      if (!f || t - f.time > this.stepContinuityGap) break;
       t = f.time;
       count++;
     }
@@ -830,6 +864,26 @@ export class Player {
       if (this.stepKeys[i] < key) return this.stepFrames.get(this.stepKeys[i]) ?? null;
     }
     return null;
+  }
+
+  private cachedFrameAtOrAfter(time: number): StepFrame | null {
+    const key = this.frameKey(time - 1e-6);
+    for (const k of this.stepKeys) {
+      if (k >= key) return this.stepFrames.get(k) ?? null;
+    }
+    return null;
+  }
+
+  private nextAdjacentCachedFrame(time: number): StepFrame | null {
+    const frame = this.nextCachedFrame(time);
+    if (!frame || frame.time - time > this.stepContinuityGap) return null;
+    return frame;
+  }
+
+  private prevAdjacentCachedFrame(time: number): StepFrame | null {
+    const frame = this.prevCachedFrame(time);
+    if (!frame || time - frame.time > this.stepContinuityGap) return null;
+    return frame;
   }
 
   private nearestCachedFrame(time: number): StepFrame | null {
@@ -982,6 +1036,16 @@ export class Player {
 
   private get playbackEnd(): number {
     return this.hasPlaybackRange ? this.outPoint : this.duration;
+  }
+
+  private isAtLoopBoundary(dir: 1 | -1): boolean {
+    return dir > 0
+      ? this.playbackEnd - this.currentTime <= this.stepContinuityGap
+      : this.currentTime - this.playbackStart <= this.stepContinuityGap;
+  }
+
+  private get stepContinuityGap(): number {
+    return Math.max(this.frameDuration * 1.8, 0.08);
   }
 
   private frameKey(time: number): number {
