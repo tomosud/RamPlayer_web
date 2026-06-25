@@ -98,6 +98,8 @@ let currentHandle: FileSystemFileHandle | null = null;
 let currentFile: File | null = null;
 let pendingRestore: PersistedRecord | undefined;
 let info: LoadedInfo | null = null;
+let openFileGeneration = 0;
+let persistChain: Promise<void> = Promise.resolve();
 let viewScaleMode: 'fit' | 'custom' = 'fit';
 let videoScale = 1;
 let videoPanX = 0;
@@ -362,6 +364,9 @@ function resetTimelineThumbnails(): void {
 
 function timelineThumbnailSlotCount(): number {
   const width = timelineCanvas.clientWidth || 1;
+  const pixels = (info?.width ?? 0) * (info?.height ?? 0);
+  if (pixels >= 8_000_000) return Math.max(10, Math.min(16, Math.floor(width / 72)));
+  if (pixels >= 3_500_000) return Math.max(14, Math.min(22, Math.floor(width / 56)));
   return Math.max(20, Math.min(30, Math.floor(width / 44)));
 }
 
@@ -392,25 +397,24 @@ function visibleThumbnailJobs(): ThumbnailJob[] {
 }
 
 function scheduleTimelineThumbnails(force = false): void {
-  if (!info || !canRunTimelineThumbnailWork()) return;
+  if (!info || !player.loaded) return;
   const now = performance.now();
   const jobs = visibleThumbnailJobs();
   if (jobs.length === 0) return;
-
-  const range = timeline.visibleRange();
-  const currentBucket = Math.round(player.currentTime * 2) / 2;
-  const signature = `${range.start.toFixed(2)}:${range.end.toFixed(2)}:${jobs.length}:${currentBucket.toFixed(1)}`;
-  if (!force && signature === lastTimelineThumbSignature && now - lastTimelineThumbScheduleAt < 250) return;
-  lastTimelineThumbSignature = signature;
-  lastTimelineThumbScheduleAt = now;
 
   timelineThumbnails = jobs
     .map((job) => timelineThumbnailCache.get(job.key))
     .filter((thumb): thumb is TimelineThumbnail => thumb !== undefined);
 
-  const missing = jobs
-    .filter((job) => !timelineThumbnailCache.has(job.key))
-    .sort((a, b) => Math.abs(a.time - player.currentTime) - Math.abs(b.time - player.currentTime));
+  if (!canRunTimelineThumbnailWork()) return;
+
+  const range = timeline.visibleRange();
+  const signature = `${range.start.toFixed(2)}:${range.end.toFixed(2)}:${jobs.length}`;
+  if (!force && signature === lastTimelineThumbSignature && now - lastTimelineThumbScheduleAt < 250) return;
+  lastTimelineThumbSignature = signature;
+  lastTimelineThumbScheduleAt = now;
+
+  const missing = jobs.filter((job) => !timelineThumbnailCache.has(job.key));
 
   timelineThumbnailQueue = missing;
   void runTimelineThumbnailWorker();
@@ -422,15 +426,18 @@ function evictTimelineThumbnailCache(): void {
   const entries = [...timelineThumbnailCache.entries()].sort(
     (a, b) => Math.abs(a[1].time - player.currentTime) - Math.abs(b[1].time - player.currentTime),
   );
-  timelineThumbnailCache = new Map(
-    entries.filter(([key], index) => visible.has(key) || index < timelineThumbCacheLimit).slice(0, timelineThumbCacheLimit),
-  );
+  const visibleEntries = entries.filter(([key]) => visible.has(key));
+  const remainingLimit = Math.max(0, timelineThumbCacheLimit - visibleEntries.length);
+  const nearbyEntries = entries.filter(([key]) => !visible.has(key)).slice(0, remainingLimit);
+  timelineThumbnailCache = new Map([...visibleEntries, ...nearbyEntries]);
 }
 
 async function runTimelineThumbnailWorker(): Promise<void> {
   if (timelineThumbnailWorkerRunning) return;
   timelineThumbnailWorkerRunning = true;
   const gen = thumbGen;
+  let attempted = false;
+  let produced = false;
 
   try {
     while (gen === thumbGen && canRunTimelineThumbnailWork() && timelineThumbnailQueue.length > 0) {
@@ -440,13 +447,13 @@ async function runTimelineThumbnailWorker(): Promise<void> {
 
       await idleDelay();
       if (gen !== thumbGen || !canRunTimelineThumbnailWork()) return;
-      const canvas = await player.thumbnailAt(job.time, timelineThumbWidth, timelineThumbHeight);
+      attempted = true;
+      const canvas = await player.keyframeThumbnailAt(job.time, timelineThumbWidth, timelineThumbHeight);
       if (gen !== thumbGen) return;
       if (!canvas) {
-        timelineThumbnailUnavailable = true;
-        timelineThumbnailQueue = [];
-        return;
+        continue;
       }
+      produced = true;
       timelineThumbnailCache.set(job.key, {
         time: job.time,
         start: job.start,
@@ -455,6 +462,10 @@ async function runTimelineThumbnailWorker(): Promise<void> {
       });
       evictTimelineThumbnailCache();
       scheduleTimelineThumbnails(true);
+    }
+    if (gen === thumbGen && canRunTimelineThumbnailWork() && attempted && !produced) {
+      timelineThumbnailUnavailable = true;
+      timelineThumbnailQueue = [];
     }
   } finally {
     timelineThumbnailWorkerRunning = false;
@@ -1050,6 +1061,7 @@ const player = new Player(canvas, {
       updateExportDialog();
       void refreshExportCopyOption();
     }
+    void persistNow();
   },
   onError(msg) {
     showError(msg);
@@ -1106,14 +1118,17 @@ async function openFile(
   handle: FileSystemFileHandle | null,
   restore?: RestoreState,
 ): Promise<void> {
+  const generation = ++openFileGeneration;
   try {
     showError(null);
     resetTimelineThumbnails();
     currentHandle = handle;
     currentFile = file;
     await player.load(file, restore);
+    if (generation !== openFileGeneration) return;
     await persistNow();
   } catch (e) {
+    if (generation !== openFileGeneration) return;
     showError(e instanceof Error ? e.message : String(e));
   }
 }
@@ -1121,7 +1136,8 @@ async function openFile(
 async function persistNow(): Promise<void> {
   if (!player.loaded || !info) return;
   const s = player.getState();
-  await savePersisted(currentHandle, {
+  const handle = currentHandle;
+  const settings = {
     name: info.name,
     size: currentFile?.size,
     lastModified: currentFile?.lastModified,
@@ -1133,7 +1149,9 @@ async function persistNow(): Promise<void> {
     outPointSet: s.outPointSet,
     loop: s.loop ?? true,
     playbackFps: s.playbackFps,
-  });
+  };
+  persistChain = persistChain.then(() => savePersisted(handle, settings));
+  await persistChain;
 }
 
 stage.addEventListener('dragover', (e) => {
@@ -1210,7 +1228,8 @@ async function onDrop(e: DragEvent): Promise<void> {
   if (!file) return;
 
   const handle = item ? await getHandleFromDrop(item) : null;
-  await openFile(file, handle, restoreForFile(file));
+  pendingRestore = undefined;
+  await openFile(file, handle);
 }
 
 window.addEventListener('keydown', (e) => {

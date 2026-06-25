@@ -3,6 +3,7 @@ import {
   AudioBufferSink,
   BlobSource,
   CanvasSink,
+  EncodedPacketSink,
   Input,
   type InputTrack,
   type WrappedAudioBuffer,
@@ -60,6 +61,7 @@ export class Player {
   private input: Input | null = null;
   private videoSink: CanvasSink | null = null;
   private thumbnailSink: CanvasSink | null = null;
+  private thumbnailPacketSink: EncodedPacketSink | null = null;
   private thumbnailUnavailable = false;
   private audioSink: AudioBufferSink | null = null;
   private audioContext: AudioContext | null = null;
@@ -96,6 +98,7 @@ export class Player {
   private outPointSet = false;
   private volume = 1;
   private workGen = 0;
+  private loadGeneration = 0;
   private stepGen = 0;
   private stepDecoding = false;
   private stepDecodingFrom = 0;
@@ -156,7 +159,13 @@ export class Player {
   }
 
   async load(file: File, restore?: RestoreState): Promise<void> {
+    const loadGeneration = ++this.loadGeneration;
+    const guardLoad = () => {
+      if (loadGeneration !== this.loadGeneration) throw new DOMException('Load was superseded.', 'AbortError');
+    };
+
     await this.dispose();
+    guardLoad();
     this.fileName = file.name;
     this.thumbnailUnavailable = false;
 
@@ -164,30 +173,49 @@ export class Player {
     this.input = input;
 
     if (!(await input.canRead())) {
+      guardLoad();
       throw new Error('This media file cannot be read. Please use MP4, MOV, WebM, or another supported format.');
     }
+    guardLoad();
 
     let videoTrack = await input.getPrimaryVideoTrack();
     let audioTrack = await input.getPrimaryAudioTrack();
+    guardLoad();
 
     if (videoTrack && (!(await videoTrack.getCodec()) || !(await videoTrack.canDecode()))) {
+      guardLoad();
       videoTrack = null;
     }
     if (audioTrack && (!(await audioTrack.getCodec()) || !(await audioTrack.canDecode()))) {
+      guardLoad();
       audioTrack = null;
     }
+    guardLoad();
     if (!videoTrack && !audioTrack) {
       throw new Error('No decodable audio or video track was found.');
     }
 
     const tracks: InputTrack[] = [videoTrack, audioTrack].filter((t): t is NonNullable<typeof t> => t !== null);
-    this.firstTimestamp = Math.max(await input.getFirstTimestamp(tracks), 0);
+    const firstTimestamp = Math.max(await input.getFirstTimestamp(tracks), 0);
+    guardLoad();
+    this.firstTimestamp = firstTimestamp;
     const endTimestamp = await this.resolveEndTimestamp(input, tracks);
+    guardLoad();
     this.duration = Math.max(0, endTimestamp - this.firstTimestamp);
     if (this.duration <= 0) throw new Error('Could not determine a valid media duration.');
 
     if (videoTrack) {
       const videoCanBeTransparent = await videoTrack.canBeTransparent();
+      const displayWidth = await videoTrack.getDisplayWidth();
+      const displayHeight = await videoTrack.getDisplayHeight();
+      let fps = 30;
+      try {
+        const stats = await videoTrack.computePacketStats(120);
+        if (stats.averagePacketRate > 0) fps = stats.averagePacketRate;
+      } catch {
+        fps = 30;
+      }
+      guardLoad();
       this.videoSink = new CanvasSink(videoTrack, {
         poolSize: 2,
         fit: 'contain',
@@ -200,19 +228,17 @@ export class Player {
         fit: 'cover',
         alpha: videoCanBeTransparent,
       });
-      this.canvas.width = await videoTrack.getDisplayWidth();
-      this.canvas.height = await videoTrack.getDisplayHeight();
-      try {
-        const stats = await videoTrack.computePacketStats(120);
-        if (stats.averagePacketRate > 0) this.fps = stats.averagePacketRate;
-      } catch {
-        this.fps = 30;
-      }
+      this.thumbnailPacketSink = new EncodedPacketSink(videoTrack);
+      this.canvas.width = displayWidth;
+      this.canvas.height = displayHeight;
+      this.fps = fps;
     } else {
+      guardLoad();
       this.canvas.width = 1;
       this.canvas.height = 1;
       this.videoSink = null;
       this.thumbnailSink = null;
+      this.thumbnailPacketSink = null;
     }
     this.frameDuration = 1 / this.fps;
     this.playbackFps = this.sanitizePlaybackFps(restore?.playbackFps ?? null);
@@ -223,9 +249,11 @@ export class Player {
     const deviceMemoryGB = (navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 4;
     this.pausedBudgetBytes = Math.min(deviceMemoryGB * 1024 * 0.4, 2048) * 1024 * 1024;
 
+    const audioSampleRate = audioTrack ? await audioTrack.getSampleRate() : undefined;
+    guardLoad();
     const AudioContextCtor = window.AudioContext;
     this.audioContext = new AudioContextCtor({
-      sampleRate: audioTrack ? await audioTrack.getSampleRate() : undefined,
+      sampleRate: audioSampleRate,
     });
     this.gainNode = this.audioContext.createGain();
     this.gainNode.connect(this.audioContext.destination);
@@ -254,6 +282,7 @@ export class Player {
     this.callbacks.onInOut(this.inPoint, this.outPoint, this.loop);
 
     await this.drawAt(this.currentTime);
+    guardLoad();
     void this.prefetchStepWindow(this.currentTime);
     this.callbacks.onTime(this.currentTime);
   }
@@ -956,6 +985,31 @@ export class Player {
     }
   }
 
+  async keyframeThumbnailAt(time: number, width: number, height: number): Promise<HTMLCanvasElement | null> {
+    if (!this.thumbnailSink || this.thumbnailUnavailable || this.playing) return null;
+    if (!this.thumbnailPacketSink) return null;
+    try {
+      const mediaTime = this.toMediaTime(this.clampToPlaybackRange(time));
+      const keyPacket =
+        (await this.thumbnailPacketSink.getKeyPacket(mediaTime)) ?? (await this.thumbnailPacketSink.getFirstKeyPacket());
+      if (!keyPacket) return null;
+
+      const frame = await this.thumbnailSink.getCanvas(keyPacket.timestamp);
+      if (!frame) return null;
+
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(width));
+      canvas.height = Math.max(1, Math.round(height));
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return null;
+
+      ctx.drawImage(frame.canvas, 0, 0, canvas.width, canvas.height);
+      return canvas;
+    } catch {
+      return null;
+    }
+  }
+
   private blit(frame: WrappedCanvas): void {
     this.ctx2d.clearRect(0, 0, this.canvas.width, this.canvas.height);
     this.ctx2d.drawImage(frame.canvas, 0, 0, this.canvas.width, this.canvas.height);
@@ -1217,6 +1271,7 @@ export class Player {
     this.audioSink = null;
     this.videoSink = null;
     this.thumbnailSink = null;
+    this.thumbnailPacketSink = null;
     this.clearStepFrames();
     this.stepDecoding = false;
     this.stepDecodingFrom = 0;
