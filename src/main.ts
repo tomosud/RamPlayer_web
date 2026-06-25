@@ -108,11 +108,12 @@ let stageDrag: { pointerId: number; x: number; y: number } | null = null;
 let thumbGen = 0;
 let timelineThumbnails: TimelineThumbnail[] = [];
 let timelineThumbnailCache = new Map<string, TimelineThumbnail>();
-let timelineThumbnailQueue: ThumbnailJob[] = [];
+let timelineThumbnailQueue: ThumbnailWork[] = [];
 let timelineThumbnailWorkerRunning = false;
 let lastTimelineThumbSignature = '';
 let lastTimelineThumbScheduleAt = 0;
 let timelineThumbnailPauseUntil = 0;
+let timelineThumbnailDisplayHoldUntil = 0;
 let timelineThumbnailUnavailable = false;
 let hoverThumb: TimelineThumbnail | null = null;
 let hoverGen = 0;
@@ -128,6 +129,7 @@ let showUiIdleTimer = 0;
 const timelineThumbWidth = 96;
 const timelineThumbHeight = 54;
 const timelineThumbCacheLimit = 180;
+const timelineExactAheadPriorityCount = 4;
 const previewThumbWidth = 180;
 const previewThumbHeight = 102;
 const exportAudioBitrateMax = 192_000;
@@ -141,6 +143,10 @@ interface ThumbnailJob {
   time: number;
   start: number;
   end: number;
+}
+
+interface ThumbnailWork extends ThumbnailJob {
+  exact: boolean;
 }
 
 function fmt(t: number): string {
@@ -244,11 +250,16 @@ function canRunTimelineThumbnailWork(): boolean {
   return player.loaded && !timelineThumbnailUnavailable && !player.playing && performance.now() >= timelineThumbnailPauseUntil;
 }
 
-function pauseTimelineThumbnailWork(ms: number): void {
+function holdTimelineThumbnailDisplay(ms: number): void {
+  timelineThumbnailDisplayHoldUntil = Math.max(timelineThumbnailDisplayHoldUntil, performance.now() + ms);
+}
+
+function pauseTimelineThumbnailWork(ms: number, holdDisplay = false): void {
   thumbGen++;
   hoverGen++;
   timelineThumbnailQueue = [];
   timelineThumbnailPauseUntil = Math.max(timelineThumbnailPauseUntil, performance.now() + ms);
+  if (holdDisplay) holdTimelineThumbnailDisplay(ms);
   lastTimelineThumbSignature = '';
 }
 
@@ -356,6 +367,7 @@ function resetTimelineThumbnails(): void {
   lastTimelineThumbSignature = '';
   lastTimelineThumbScheduleAt = 0;
   timelineThumbnailPauseUntil = 0;
+  timelineThumbnailDisplayHoldUntil = 0;
   timelineThumbnailUnavailable = false;
   hoverThumb = null;
   hoverTime = null;
@@ -396,15 +408,63 @@ function visibleThumbnailJobs(): ThumbnailJob[] {
   return jobs;
 }
 
+function rangesOverlap(a: { start: number; end: number }, b: { start: number; end: number }): boolean {
+  return a.start < b.end && b.start < a.end;
+}
+
+function updateTimelineThumbnailDisplay(jobs: ThumbnailJob[], preserveExisting: boolean): void {
+  const cached = jobs
+    .map((job) => timelineThumbnailCache.get(job.key))
+    .filter((thumb): thumb is TimelineThumbnail => thumb !== undefined);
+
+  if (!preserveExisting) {
+    timelineThumbnails = cached;
+    return;
+  }
+
+  const range = timeline.visibleRange();
+  const existing = timelineThumbnails.filter(
+    (thumb) =>
+      rangesOverlap(thumb, range) &&
+      !cached.some((replacement) => rangesOverlap(thumb, replacement)),
+  );
+  timelineThumbnails = [...existing, ...cached].sort((a, b) => a.start - b.start);
+}
+
+function orderedExactThumbnailJobs(jobs: ThumbnailJob[]): ThumbnailJob[] {
+  if (jobs.length <= 1) return jobs;
+  const ordered = [...jobs].sort((a, b) => a.time - b.time);
+  const firstAhead = ordered.findIndex((job) => job.end > player.currentTime);
+  const anchor = firstAhead < 0 ? ordered.length - 1 : firstAhead;
+  const priorityStart = anchor;
+  const priorityEnd = Math.min(ordered.length, anchor + timelineExactAheadPriorityCount);
+  const priority = ordered.slice(priorityStart, priorityEnd);
+  const before = ordered.slice(0, priorityStart);
+  const after = ordered.slice(priorityEnd);
+  return [...priority, ...before, ...after];
+}
+
+function thumbnailQueueForJobs(jobs: ThumbnailJob[]): ThumbnailWork[] {
+  const keyframeJobs = jobs.filter((job) => !timelineThumbnailCache.has(job.key));
+  const exactJobs = orderedExactThumbnailJobs(jobs.filter((job) => {
+    const thumb = timelineThumbnailCache.get(job.key);
+    return thumb?.exact !== true;
+  }));
+
+  return [
+    ...keyframeJobs.map((job) => ({ ...job, exact: false })),
+    ...exactJobs.map((job) => ({ ...job, exact: true })),
+  ];
+}
+
 function scheduleTimelineThumbnails(force = false): void {
   if (!info || !player.loaded) return;
   const now = performance.now();
   const jobs = visibleThumbnailJobs();
   if (jobs.length === 0) return;
+  const missing = thumbnailQueueForJobs(jobs);
 
-  timelineThumbnails = jobs
-    .map((job) => timelineThumbnailCache.get(job.key))
-    .filter((thumb): thumb is TimelineThumbnail => thumb !== undefined);
+  updateTimelineThumbnailDisplay(jobs, performance.now() < timelineThumbnailDisplayHoldUntil || missing.length > 0);
 
   if (!canRunTimelineThumbnailWork()) return;
 
@@ -413,8 +473,6 @@ function scheduleTimelineThumbnails(force = false): void {
   if (!force && signature === lastTimelineThumbSignature && now - lastTimelineThumbScheduleAt < 250) return;
   lastTimelineThumbSignature = signature;
   lastTimelineThumbScheduleAt = now;
-
-  const missing = jobs.filter((job) => !timelineThumbnailCache.has(job.key));
 
   timelineThumbnailQueue = missing;
   void runTimelineThumbnailWorker();
@@ -443,12 +501,16 @@ async function runTimelineThumbnailWorker(): Promise<void> {
     while (gen === thumbGen && canRunTimelineThumbnailWork() && timelineThumbnailQueue.length > 0) {
       const job = timelineThumbnailQueue.shift() ?? null;
       if (!job) break;
-      if (timelineThumbnailCache.has(job.key)) continue;
+      const cached = timelineThumbnailCache.get(job.key);
+      if (job.exact && cached?.exact === true) continue;
+      if (!job.exact && cached !== undefined) continue;
 
       await idleDelay();
       if (gen !== thumbGen || !canRunTimelineThumbnailWork()) return;
       attempted = true;
-      const canvas = await player.keyframeThumbnailAt(job.time, timelineThumbWidth, timelineThumbHeight);
+      const canvas = job.exact
+        ? await player.thumbnailAt(job.time, timelineThumbWidth, timelineThumbHeight)
+        : await player.keyframeThumbnailAt(job.time, timelineThumbWidth, timelineThumbHeight);
       if (gen !== thumbGen) return;
       if (!canvas) {
         continue;
@@ -459,6 +521,7 @@ async function runTimelineThumbnailWorker(): Promise<void> {
         start: job.start,
         end: job.end,
         canvas,
+        exact: job.exact,
       });
       evictTimelineThumbnailCache();
       scheduleTimelineThumbnails(true);
@@ -1088,6 +1151,15 @@ const timeline = new Timeline(timelineCanvas, {
     if (exportRunning) return;
     if (t === null) hideTimelinePreview();
     else showTimelinePreview(t, x, y);
+  },
+  onViewChanging: () => {
+    if (exportRunning) return;
+    pauseTimelineThumbnailWork(450, true);
+  },
+  onViewChanged: () => {
+    if (exportRunning) return;
+    holdTimelineThumbnailDisplay(240);
+    resumeTimelineThumbnailWork(220);
   },
 });
 

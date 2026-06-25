@@ -16,6 +16,7 @@ export interface TimelineThumbnail {
   start: number;
   end: number;
   canvas: HTMLCanvasElement;
+  exact?: boolean;
 }
 
 export interface TimelineCallbacks {
@@ -23,6 +24,8 @@ export interface TimelineCallbacks {
   onSetIn(time: number): void;
   onSetOut(time: number): void;
   onHover(time: number | null, clientX: number, clientY: number): void;
+  onViewChanging(): void;
+  onViewChanged(): void;
 }
 
 const css = (name: string) =>
@@ -169,6 +172,7 @@ export class Timeline {
 
   private onUp = (e: PointerEvent): void => {
     if (!this.drag) return;
+    const drag = this.drag;
     try {
       this.canvas.releasePointerCapture(e.pointerId);
     } catch {
@@ -176,6 +180,7 @@ export class Timeline {
     }
     this.drag = null;
     this.canvas.style.cursor = 'pointer';
+    if (drag === 'pan') this.callbacks.onViewChanged();
   };
 
   private onContextMenu = (e: MouseEvent): void => {
@@ -192,6 +197,7 @@ export class Timeline {
     const start = clamp(this.panViewStart - dx * secondsPerPx, 0, this.state.duration - span);
     this.viewStart = start;
     this.viewEnd = start + span;
+    this.callbacks.onViewChanging();
     this.render(this.state);
   }
 
@@ -208,7 +214,9 @@ export class Timeline {
     const start = clamp(anchor - anchorRatio * nextSpan, 0, this.state.duration - nextSpan);
     this.viewStart = start;
     this.viewEnd = start + nextSpan;
+    this.callbacks.onViewChanging();
     this.render(this.state);
+    this.callbacks.onViewChanged();
   };
 
   render(state: TimelineState): void {
