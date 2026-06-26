@@ -66,6 +66,7 @@ export class Player {
   private audioSink: AudioBufferSink | null = null;
   private audioContext: AudioContext | null = null;
   private gainNode: GainNode | null = null;
+  private videoCanBeTransparent = false;
 
   private raf = 0;
   private asyncId = 0;
@@ -99,10 +100,13 @@ export class Player {
   private volume = 1;
   private workGen = 0;
   private loadGeneration = 0;
+  private thumbnailWorkGen = 0;
   private stepGen = 0;
   private stepDecoding = false;
   private stepDecodingFrom = 0;
   private stepDecodingTo = 0;
+  private stepPrefetchRunning = false;
+  private requestedStepPrefetchCenter: number | null = null;
   private stepFrames = new Map<number, StepFrame>();
   private stepKeys: number[] = [];
   /** UI フィルムストリップ表示用の固定半径（中央±10 = 21スロット）。キャッシュ容量とは独立。 */
@@ -120,6 +124,7 @@ export class Player {
   private readonly playingBudgetBytes = 256 * 1024 * 1024;
   /** 一時停止中のフレームキャッシュ予算（deviceMemory から算出、上限2GB）。load() で確定。 */
   private pausedBudgetBytes = 2 * 1024 * 1024 * 1024;
+  private lastVideoIssueLogAt = 0;
 
   /** 現在の状態に応じたフレームキャッシュ予算（バイト）。一時停止中は大きく取る。 */
   private get frameBudgetBytes(): number {
@@ -156,6 +161,14 @@ export class Player {
 
   get loaded(): boolean {
     return this.input !== null;
+  }
+
+  get interactiveBusy(): boolean {
+    return this.playing || this.seekRunning || this.stepQueueRunning || this.stepDecoding || this.stepPrefetchRunning;
+  }
+
+  interruptThumbnailWork(): void {
+    this.thumbnailWorkGen++;
   }
 
   async load(file: File, restore?: RestoreState): Promise<void> {
@@ -206,6 +219,7 @@ export class Player {
 
     if (videoTrack) {
       const videoCanBeTransparent = await videoTrack.canBeTransparent();
+      this.videoCanBeTransparent = videoCanBeTransparent;
       const displayWidth = await videoTrack.getDisplayWidth();
       const displayHeight = await videoTrack.getDisplayHeight();
       let fps = 30;
@@ -239,6 +253,7 @@ export class Player {
       this.videoSink = null;
       this.thumbnailSink = null;
       this.thumbnailPacketSink = null;
+      this.videoCanBeTransparent = false;
     }
     this.frameDuration = 1 / this.fps;
     this.playbackFps = this.sanitizePlaybackFps(restore?.playbackFps ?? null);
@@ -283,7 +298,7 @@ export class Player {
 
     await this.drawAt(this.currentTime);
     guardLoad();
-    void this.prefetchStepWindow(this.currentTime);
+    this.scheduleStepPrefetch(this.currentTime);
     this.callbacks.onTime(this.currentTime);
   }
 
@@ -304,6 +319,8 @@ export class Player {
 
   async play(): Promise<void> {
     if (!this.loaded || !this.audioContext || this.playing) return;
+    this.requestedStepPrefetchCenter = null;
+    this.interruptThumbnailWork();
     this.stepGen++;
     this.stepDecoding = false;
 
@@ -429,6 +446,8 @@ export class Player {
 
   async seek(time: number, keepPlaying = false): Promise<void> {
     if (!this.loaded) return;
+    this.requestedStepPrefetchCenter = null;
+    this.interruptThumbnailWork();
     this.workGen++;
     this.stepGen++;
     this.stepDecoding = false;
@@ -465,6 +484,7 @@ export class Player {
 
   private queueStep(dir: 1 | -1): void {
     if (!this.videoSink) return;
+    this.interruptThumbnailWork();
     this.pendingStepDelta += dir;
     if (!this.stepQueueRunning) void this.drainStepQueue();
   }
@@ -492,6 +512,7 @@ export class Player {
     } finally {
       this.stepQueueRunning = false;
       if (this.pendingStepDelta !== 0) void this.drainStepQueue();
+      else this.scheduleStepPrefetch(this.currentTime);
     }
   }
 
@@ -584,10 +605,12 @@ export class Player {
       await this.drawAt(this.currentTime);
     }
 
-    void this.prefetchStepWindow(this.currentTime);
+    this.scheduleStepPrefetch(this.currentTime);
   }
 
   prepareForHeavyWork(): void {
+    this.requestedStepPrefetchCenter = null;
+    this.interruptThumbnailWork();
     this.pendingStepDelta = 0;
     this.workGen++;
     this.stepGen++;
@@ -602,6 +625,7 @@ export class Player {
     if (dir > 0 && this.contiguousFramesAhead(center) > 0) return;
     if (dir < 0 && this.contiguousFramesBehind(center) > 0) return;
 
+    this.interruptThumbnailWork();
     const gen = ++this.stepGen;
     await this.stopVideoIterator();
     this.stepDecoding = true;
@@ -622,11 +646,58 @@ export class Player {
 
   private scheduleStepPrefetch(center: number): void {
     if (!this.videoSink || this.playing) return;
-    if (this.stepDecoding) return;
-    const ahead = this.contiguousFramesAhead(center);
-    const behind = this.contiguousFramesBehind(center);
-    if (ahead >= this.refillThresholdFrames && behind >= this.refillThresholdFrames) return;
-    void this.prefetchStepWindow(center);
+    this.requestedStepPrefetchCenter = this.clampToPlaybackRange(center);
+    if (this.stepPrefetchRunning || this.stepQueueRunning || this.seekRunning) return;
+    void this.runStepPrefetchLoop();
+  }
+
+  private async runStepPrefetchLoop(): Promise<void> {
+    if (!this.videoSink || this.stepPrefetchRunning) return;
+    this.stepPrefetchRunning = true;
+
+    try {
+      while (this.videoSink && !this.playing && !this.seekRunning && !this.stepQueueRunning) {
+        const requestedCenter = this.requestedStepPrefetchCenter;
+        if (requestedCenter === null) break;
+
+        this.requestedStepPrefetchCenter = null;
+        const center = this.clampToPlaybackRange(requestedCenter);
+        if (this.stepPrefetchSatisfied(center)) continue;
+
+        const frameCountBefore = this.stepFrames.size;
+        await this.prefetchStepWindow(center);
+
+        if (this.playing || this.seekRunning || this.stepQueueRunning) break;
+        if (this.requestedStepPrefetchCenter !== null) continue;
+        if (this.stepPrefetchSatisfied(this.currentTime)) break;
+        if (this.stepFrames.size === frameCountBefore) break;
+
+        this.requestedStepPrefetchCenter = this.currentTime;
+      }
+    } finally {
+      this.stepPrefetchRunning = false;
+      if (
+        this.requestedStepPrefetchCenter !== null &&
+        this.videoSink &&
+        !this.playing &&
+        !this.seekRunning &&
+        !this.stepQueueRunning
+      ) {
+        void this.runStepPrefetchLoop();
+      }
+    }
+  }
+
+  private stepPrefetchSatisfied(center: number): boolean {
+    return (
+      this.contiguousFramesAhead(center) >= this.refillThresholdFrames &&
+      this.contiguousFramesBehind(center) >= this.refillThresholdFrames
+    );
+  }
+
+  private shouldRecenterStepPrefetch(center: number): boolean {
+    const requestedCenter = this.requestedStepPrefetchCenter;
+    return requestedCenter !== null && Math.abs(requestedCenter - center) > this.frameDuration * 2;
   }
 
   /**
@@ -639,6 +710,7 @@ export class Player {
    */
   private async prefetchStepWindow(center: number, full = true): Promise<void> {
     if (!this.videoSink) return;
+    this.interruptThumbnailWork();
     const gen = ++this.stepGen;
     await this.stopVideoIterator();
     this.stepDecoding = true;
@@ -655,9 +727,11 @@ export class Player {
         const from = Math.max(this.playbackStart, clampedCenter - span);
         const to = Math.min(this.playbackEnd, clampedCenter + span);
         await this.decodeStageAroundCenter(gen, clampedCenter, from, to);
+        if (gen !== this.stepGen || this.shouldRecenterStepPrefetch(clampedCenter)) return;
         if (!loopBoundaryPrefetched) {
           loopBoundaryPrefetched = true;
           await this.prefetchLoopBoundary(gen, clampedCenter);
+          if (gen !== this.stepGen || this.shouldRecenterStepPrefetch(clampedCenter)) return;
         }
         await delay(0);
       }
@@ -941,6 +1015,12 @@ export class Player {
     const first = (await this.videoIterator.next()).value ?? null;
     const second = (await this.videoIterator.next()).value ?? null;
     if (id !== this.asyncId) return;
+    if (!first) {
+      this.logVideoIssue('video iterator did not return an initial frame', {
+        currentTime: this.currentTime,
+        playbackEnd: this.playbackEnd,
+      });
+    }
 
     const mediaNow = this.toMediaTime(this.currentTime);
     if (drawFirst && first) {
@@ -953,17 +1033,27 @@ export class Player {
     }
   }
 
+  private canRunThumbnailWork(gen: number): boolean {
+    return gen === this.thumbnailWorkGen && !this.interactiveBusy;
+  }
+
   private async drawAt(time: number, workGen = this.workGen): Promise<void> {
     if (!this.videoSink) return;
     const frame = await this.videoSink.getCanvas(this.toMediaTime(time));
     if (workGen !== this.workGen) return;
-    if (frame) this.blitStepFrame(this.storeWrappedCanvas(frame));
+    if (frame) {
+      this.blitStepFrame(this.storeWrappedCanvas(frame));
+    } else {
+      this.logVideoIssue('video sink returned no frame for drawAt', { time });
+    }
   }
 
   async thumbnailAt(time: number, width: number, height: number): Promise<HTMLCanvasElement | null> {
-    if (!this.thumbnailSink || this.thumbnailUnavailable || this.playing) return null;
+    const gen = this.thumbnailWorkGen;
+    if (!this.thumbnailSink || this.thumbnailUnavailable || !this.canRunThumbnailWork(gen)) return null;
     try {
       const frame = await this.thumbnailSink.getCanvas(this.toMediaTime(this.clampToPlaybackRange(time)));
+      if (!this.canRunThumbnailWork(gen)) return null;
       if (!frame) return null;
 
       const canvas = document.createElement('canvas');
@@ -971,6 +1061,7 @@ export class Player {
       canvas.height = Math.max(1, Math.round(height));
       const ctx = canvas.getContext('2d');
       if (!ctx) return null;
+      if (!this.canRunThumbnailWork(gen)) return null;
 
       const scale = Math.max(canvas.width / frame.canvas.width, canvas.height / frame.canvas.height);
       const sw = canvas.width / scale;
@@ -978,23 +1069,28 @@ export class Player {
       const sx = Math.max(0, (frame.canvas.width - sw) / 2);
       const sy = Math.max(0, (frame.canvas.height - sh) / 2);
       ctx.drawImage(frame.canvas, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+      if (!this.canRunThumbnailWork(gen)) return null;
       return canvas;
     } catch {
+      if (!this.canRunThumbnailWork(gen)) return null;
       this.thumbnailUnavailable = true;
       return null;
     }
   }
 
   async keyframeThumbnailAt(time: number, width: number, height: number): Promise<HTMLCanvasElement | null> {
-    if (!this.thumbnailSink || this.thumbnailUnavailable || this.playing) return null;
+    const gen = this.thumbnailWorkGen;
+    if (!this.thumbnailSink || this.thumbnailUnavailable || !this.canRunThumbnailWork(gen)) return null;
     if (!this.thumbnailPacketSink) return null;
     try {
       const mediaTime = this.toMediaTime(this.clampToPlaybackRange(time));
       const keyPacket =
         (await this.thumbnailPacketSink.getKeyPacket(mediaTime)) ?? (await this.thumbnailPacketSink.getFirstKeyPacket());
+      if (!this.canRunThumbnailWork(gen)) return null;
       if (!keyPacket) return null;
 
       const frame = await this.thumbnailSink.getCanvas(keyPacket.timestamp);
+      if (!this.canRunThumbnailWork(gen)) return null;
       if (!frame) return null;
 
       const canvas = document.createElement('canvas');
@@ -1002,24 +1098,68 @@ export class Player {
       canvas.height = Math.max(1, Math.round(height));
       const ctx = canvas.getContext('2d');
       if (!ctx) return null;
+      if (!this.canRunThumbnailWork(gen)) return null;
 
       ctx.drawImage(frame.canvas, 0, 0, canvas.width, canvas.height);
+      if (!this.canRunThumbnailWork(gen)) return null;
       return canvas;
     } catch {
+      if (!this.canRunThumbnailWork(gen)) return null;
       return null;
     }
   }
 
   private blit(frame: WrappedCanvas): void {
-    this.ctx2d.clearRect(0, 0, this.canvas.width, this.canvas.height);
-    this.ctx2d.drawImage(frame.canvas, 0, 0, this.canvas.width, this.canvas.height);
+    if (!this.canDrawSource(frame.canvas, 'playback')) return;
+    try {
+      if (this.videoCanBeTransparent) this.ctx2d.clearRect(0, 0, this.canvas.width, this.canvas.height);
+      this.ctx2d.drawImage(frame.canvas, 0, 0, this.canvas.width, this.canvas.height);
+    } catch (error) {
+      this.logVideoIssue('drawImage failed during playback blit', { error });
+      return;
+    }
     this.lastDrawnMediaTime = frame.timestamp;
   }
 
   private blitStepFrame(frame: StepFrame): void {
-    this.ctx2d.clearRect(0, 0, this.canvas.width, this.canvas.height);
-    this.ctx2d.drawImage(frame.canvas, 0, 0, this.canvas.width, this.canvas.height);
+    if (!this.canDrawSource(frame.canvas, 'step')) return;
+    try {
+      if (this.videoCanBeTransparent) this.ctx2d.clearRect(0, 0, this.canvas.width, this.canvas.height);
+      this.ctx2d.drawImage(frame.canvas, 0, 0, this.canvas.width, this.canvas.height);
+    } catch (error) {
+      this.logVideoIssue('drawImage failed during step blit', { error, time: frame.time });
+      return;
+    }
     this.lastDrawnMediaTime = this.toMediaTime(frame.time);
+  }
+
+  private canDrawSource(source: HTMLCanvasElement | OffscreenCanvas, label: string): boolean {
+    if (source.width > 0 && source.height > 0 && this.canvas.width > 0 && this.canvas.height > 0) return true;
+    this.logVideoIssue('invalid canvas dimensions before draw', {
+      label,
+      sourceWidth: source.width,
+      sourceHeight: source.height,
+      targetWidth: this.canvas.width,
+      targetHeight: this.canvas.height,
+    });
+    return false;
+  }
+
+  private logVideoIssue(message: string, details: Record<string, unknown> = {}): void {
+    const now = performance.now();
+    if (now - this.lastVideoIssueLogAt < 1000) return;
+    this.lastVideoIssueLogAt = now;
+    console.warn(`[RamPlayer] ${message}`, {
+      ...details,
+      currentTime: this.currentTime,
+      playing: this.playing,
+      seekRunning: this.seekRunning,
+      stepQueueRunning: this.stepQueueRunning,
+      stepDecoding: this.stepDecoding,
+      asyncId: this.asyncId,
+      workGen: this.workGen,
+      stepGen: this.stepGen,
+    });
   }
 
   private getPlaybackTime(): number {
@@ -1255,6 +1395,8 @@ export class Player {
   }
 
   async dispose(): Promise<void> {
+    this.requestedStepPrefetchCenter = null;
+    this.interruptThumbnailWork();
     this.workGen++;
     this.stopPlaybackSideEffects();
     await this.videoIterator?.return(undefined);

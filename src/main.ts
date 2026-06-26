@@ -114,6 +114,7 @@ let lastTimelineThumbSignature = '';
 let lastTimelineThumbScheduleAt = 0;
 let timelineThumbnailPauseUntil = 0;
 let timelineThumbnailDisplayHoldUntil = 0;
+let timelineThumbnailResumeGen = 0;
 let timelineThumbnailUnavailable = false;
 let hoverThumb: TimelineThumbnail | null = null;
 let hoverGen = 0;
@@ -247,7 +248,12 @@ function idleDelay(): Promise<void> {
 }
 
 function canRunTimelineThumbnailWork(): boolean {
-  return player.loaded && !timelineThumbnailUnavailable && !player.playing && performance.now() >= timelineThumbnailPauseUntil;
+  return (
+    player.loaded &&
+    !timelineThumbnailUnavailable &&
+    !player.interactiveBusy &&
+    performance.now() >= timelineThumbnailPauseUntil
+  );
 }
 
 function holdTimelineThumbnailDisplay(ms: number): void {
@@ -255,6 +261,8 @@ function holdTimelineThumbnailDisplay(ms: number): void {
 }
 
 function pauseTimelineThumbnailWork(ms: number, holdDisplay = false): void {
+  timelineThumbnailResumeGen++;
+  player.interruptThumbnailWork();
   thumbGen++;
   hoverGen++;
   timelineThumbnailQueue = [];
@@ -264,9 +272,13 @@ function pauseTimelineThumbnailWork(ms: number, holdDisplay = false): void {
 }
 
 function resumeTimelineThumbnailWork(delayMs = 180): void {
+  const resumeGen = ++timelineThumbnailResumeGen;
   timelineThumbnailPauseUntil = Math.max(timelineThumbnailPauseUntil, performance.now() + delayMs);
   lastTimelineThumbSignature = '';
-  window.setTimeout(() => scheduleTimelineThumbnails(true), delayMs + 20);
+  window.setTimeout(() => {
+    if (resumeGen !== timelineThumbnailResumeGen) return;
+    if (canRunTimelineThumbnailWork()) scheduleTimelineThumbnails(true);
+  }, delayMs + 20);
 }
 
 function drawPreviewThumb(canvas: HTMLCanvasElement): void {
@@ -337,6 +349,7 @@ async function ensureHoverThumbnail(): Promise<void> {
       const gen = hoverGen;
       const thumb = await player.thumbnailAt(time, previewThumbWidth, previewThumbHeight);
       if (gen !== hoverGen || hoverTime === null) break;
+      if (!canRunTimelineThumbnailWork()) break;
       if (!thumb) {
         timelineThumbnailUnavailable = true;
         timelineThumbnailQueue = [];
@@ -368,6 +381,7 @@ function resetTimelineThumbnails(): void {
   lastTimelineThumbScheduleAt = 0;
   timelineThumbnailPauseUntil = 0;
   timelineThumbnailDisplayHoldUntil = 0;
+  timelineThumbnailResumeGen++;
   timelineThumbnailUnavailable = false;
   hoverThumb = null;
   hoverTime = null;
@@ -511,7 +525,7 @@ async function runTimelineThumbnailWorker(): Promise<void> {
       const canvas = job.exact
         ? await player.thumbnailAt(job.time, timelineThumbWidth, timelineThumbHeight)
         : await player.keyframeThumbnailAt(job.time, timelineThumbWidth, timelineThumbHeight);
-      if (gen !== thumbGen) return;
+      if (gen !== thumbGen || !canRunTimelineThumbnailWork()) return;
       if (!canvas) {
         continue;
       }
@@ -532,7 +546,9 @@ async function runTimelineThumbnailWorker(): Promise<void> {
     }
   } finally {
     timelineThumbnailWorkerRunning = false;
-    if (gen === thumbGen && timelineThumbnailQueue.length > 0) void runTimelineThumbnailWorker();
+    if (gen === thumbGen && canRunTimelineThumbnailWork() && timelineThumbnailQueue.length > 0) {
+      void runTimelineThumbnailWorker();
+    }
   }
 }
 
