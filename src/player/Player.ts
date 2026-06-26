@@ -106,6 +106,7 @@ export class Player {
   private stepDecodingFrom = 0;
   private stepDecodingTo = 0;
   private stepPrefetchRunning = false;
+  private stepPrefetchLoopGen = 0;
   private requestedStepPrefetchCenter: number | null = null;
   private stepFrames = new Map<number, StepFrame>();
   private stepKeys: number[] = [];
@@ -165,6 +166,10 @@ export class Player {
 
   get interactiveBusy(): boolean {
     return this.playing || this.seekRunning || this.stepQueueRunning || this.stepDecoding || this.stepPrefetchRunning;
+  }
+
+  get thumbnailBusy(): boolean {
+    return this.playing || this.seekRunning || this.stepQueueRunning || (this.stepDecoding && !this.stepPrefetchRunning);
   }
 
   interruptThumbnailWork(): void {
@@ -379,6 +384,7 @@ export class Player {
         this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
         this.callbacks.onState(false);
         this.callbacks.onTime(this.currentTime);
+        void this.enterStepMode(this.currentTime);
       }
       return;
     }
@@ -653,10 +659,17 @@ export class Player {
 
   private async runStepPrefetchLoop(): Promise<void> {
     if (!this.videoSink || this.stepPrefetchRunning) return;
+    const loopGen = this.stepPrefetchLoopGen;
     this.stepPrefetchRunning = true;
 
     try {
-      while (this.videoSink && !this.playing && !this.seekRunning && !this.stepQueueRunning) {
+      while (
+        loopGen === this.stepPrefetchLoopGen &&
+        this.videoSink &&
+        !this.playing &&
+        !this.seekRunning &&
+        !this.stepQueueRunning
+      ) {
         const requestedCenter = this.requestedStepPrefetchCenter;
         if (requestedCenter === null) break;
 
@@ -667,6 +680,7 @@ export class Player {
         const frameCountBefore = this.stepFrames.size;
         await this.prefetchStepWindow(center);
 
+        if (loopGen !== this.stepPrefetchLoopGen) break;
         if (this.playing || this.seekRunning || this.stepQueueRunning) break;
         if (this.requestedStepPrefetchCenter !== null) continue;
         if (this.stepPrefetchSatisfied(this.currentTime)) break;
@@ -675,8 +689,9 @@ export class Player {
         this.requestedStepPrefetchCenter = this.currentTime;
       }
     } finally {
-      this.stepPrefetchRunning = false;
+      if (loopGen === this.stepPrefetchLoopGen) this.stepPrefetchRunning = false;
       if (
+        loopGen === this.stepPrefetchLoopGen &&
         this.requestedStepPrefetchCenter !== null &&
         this.videoSink &&
         !this.playing &&
@@ -783,6 +798,7 @@ export class Player {
         if (to - aheadEdge > minSpan) {
           const chunkTo = Math.min(to, aheadEdge + this.prefetchChunkSec);
           await this.decodeRange(gen, aheadEdge, chunkTo);
+          if (gen !== this.stepGen || this.shouldRecenterStepPrefetch(center)) return;
           const nextAheadEdge = this.contiguousAheadEdge(center);
           aheadBlocked = nextAheadEdge <= aheadEdge + minSpan;
           didWork = true;
@@ -799,6 +815,7 @@ export class Player {
         if (behindEdge - from > minSpan) {
           const chunkFrom = Math.max(from, behindEdge - this.prefetchChunkSec);
           await this.decodeRange(gen, chunkFrom, behindEdge);
+          if (gen !== this.stepGen || this.shouldRecenterStepPrefetch(center)) return;
           const nextBehindEdge = this.contiguousBehindEdge(center);
           behindBlocked = nextBehindEdge >= behindEdge - minSpan;
           didWork = true;
@@ -1034,7 +1051,7 @@ export class Player {
   }
 
   private canRunThumbnailWork(gen: number): boolean {
-    return gen === this.thumbnailWorkGen && !this.interactiveBusy;
+    return gen === this.thumbnailWorkGen && !this.thumbnailBusy;
   }
 
   private async drawAt(time: number, workGen = this.workGen): Promise<void> {
@@ -1398,6 +1415,9 @@ export class Player {
     this.requestedStepPrefetchCenter = null;
     this.interruptThumbnailWork();
     this.workGen++;
+    this.stepGen++;
+    this.stepPrefetchLoopGen++;
+    this.stepPrefetchRunning = false;
     this.stopPlaybackSideEffects();
     await this.videoIterator?.return(undefined);
     this.videoIterator = null;

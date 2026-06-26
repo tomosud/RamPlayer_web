@@ -251,7 +251,7 @@ function canRunTimelineThumbnailWork(): boolean {
   return (
     player.loaded &&
     !timelineThumbnailUnavailable &&
-    !player.interactiveBusy &&
+    !player.thumbnailBusy &&
     performance.now() >= timelineThumbnailPauseUntil
   );
 }
@@ -1328,6 +1328,7 @@ window.addEventListener('keydown', (e) => {
   }
   if (!player.loaded) return;
   if (exportRunning) return;
+  if (isShortcutInputTarget(e.target)) return;
 
   switch (e.key) {
     case ' ':
