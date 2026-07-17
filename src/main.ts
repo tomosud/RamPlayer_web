@@ -211,7 +211,7 @@ function exportPlan(bitrateScale: number): { videoBitrate: number; audioBitrate:
 
 function frameNumber(t: number): number {
   if (!info) return 0;
-  return Math.max(0, Math.round(t * info.fps));
+  return Math.max(0, Math.floor(t * info.fps + 1e-6));
 }
 
 function totalFrames(): number {
@@ -232,9 +232,10 @@ function fmtTimecode(t: number): string {
 }
 
 function updateTimeReadout(t: number): void {
-  curTimeEl.textContent = fmt(t);
-  timecodeLabel.textContent = `TC ${fmtTimecode(t)}`;
-  frameLabel.textContent = `Frame ${frameNumber(t)} / ${totalFrames()}`;
+  const visibleTime = player.loaded ? player.visibleFrameTime : t;
+  curTimeEl.textContent = fmt(visibleTime);
+  timecodeLabel.textContent = `TC ${fmtTimecode(visibleTime)}`;
+  frameLabel.textContent = `Frame ${frameNumber(visibleTime)} / ${totalFrames()}`;
 }
 
 function idleDelay(): Promise<void> {
@@ -1183,7 +1184,7 @@ function uiLoop(): void {
   if (player.loaded) {
     timeline.render({
       duration: player.duration,
-      currentTime: player.currentTime,
+      currentTime: player.visibleFrameTime,
       inPoint: player.inPoint,
       outPoint: player.outPoint,
       ranges: player.cacheRanges(),
@@ -1192,7 +1193,7 @@ function uiLoop(): void {
       thumbnails: timelineThumbnails,
     });
     scheduleTimelineThumbnails();
-    renderFilmstrip(player.stepStripFrames(), player.currentTime);
+    renderFilmstrip(player.stepStripFrames(), player.visibleFrameTime);
     const usedMB = player.cacheBytes / (1024 * 1024);
     const budgetMB = player.cacheBudgetBytes / (1024 * 1024);
     memUsage.textContent = `RAM ${usedMB.toFixed(0)}MB / ${budgetMB.toFixed(0)}MB (${player.cacheFrameCount}f)`;

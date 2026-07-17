@@ -301,8 +301,12 @@ export class Player {
     });
     this.callbacks.onInOut(this.inPoint, this.outPoint, this.loop);
 
-    await this.drawAt(this.currentTime);
+    const initialFrame = await this.drawAt(this.currentTime);
     guardLoad();
+    if (initialFrame) {
+      this.currentTime = this.clampToPlaybackRange(initialFrame.time);
+      this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
+    }
     this.scheduleStepPrefetch(this.currentTime);
     this.callbacks.onTime(this.currentTime);
   }
@@ -396,7 +400,7 @@ export class Player {
   };
 
   private renderDueFrames(): void {
-    const playbackMediaTime = this.toMediaTime(this.currentTime);
+    const playbackMediaTime = this.toLookupMediaTime(this.currentTime);
     if (this.nextFrame && this.nextFrame.timestamp <= playbackMediaTime) {
       this.blit(this.nextFrame);
       this.nextFrame = null;
@@ -411,7 +415,7 @@ export class Player {
       const frame = next.value ?? null;
       if (!frame || id !== this.asyncId) break;
 
-      if (frame.timestamp <= this.toMediaTime(this.currentTime)) {
+      if (frame.timestamp <= this.toLookupMediaTime(this.currentTime)) {
         this.blit(frame);
       } else {
         this.nextFrame = frame;
@@ -470,7 +474,11 @@ export class Player {
         this.pendingSeekTime = null;
         this.currentTime = this.clampToPlaybackRange(t);
         this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
-        await this.drawAt(this.currentTime);
+        const frame = await this.drawAt(this.currentTime);
+        if (frame) {
+          this.currentTime = this.clampToPlaybackRange(frame.time);
+          this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
+        }
       }
     } finally {
       this.seekRunning = false;
@@ -608,7 +616,11 @@ export class Player {
       this.currentTime = current.time;
       this.callbacks.onTime(this.currentTime);
     } else {
-      await this.drawAt(this.currentTime);
+      const frame = await this.drawAt(this.currentTime);
+      if (frame) {
+        this.currentTime = this.clampToPlaybackRange(frame.time);
+        this.callbacks.onTime(this.currentTime);
+      }
     }
 
     this.scheduleStepPrefetch(this.currentTime);
@@ -1039,7 +1051,7 @@ export class Player {
       });
     }
 
-    const mediaNow = this.toMediaTime(this.currentTime);
+    const mediaNow = this.toLookupMediaTime(this.currentTime);
     if (drawFirst && first) {
       this.blit(first);
       this.nextFrame = second;
@@ -1054,14 +1066,17 @@ export class Player {
     return gen === this.thumbnailWorkGen && !this.thumbnailBusy;
   }
 
-  private async drawAt(time: number, workGen = this.workGen): Promise<void> {
-    if (!this.videoSink) return;
-    const frame = await this.videoSink.getCanvas(this.toMediaTime(time));
-    if (workGen !== this.workGen) return;
+  private async drawAt(time: number, workGen = this.workGen): Promise<StepFrame | null> {
+    if (!this.videoSink) return null;
+    const frame = await this.videoSink.getCanvas(this.toLookupMediaTime(time));
+    if (workGen !== this.workGen) return null;
     if (frame) {
-      this.blitStepFrame(this.storeWrappedCanvas(frame));
+      const cached = this.storeWrappedCanvas(frame);
+      this.blitStepFrame(cached);
+      return cached;
     } else {
       this.logVideoIssue('video sink returned no frame for drawAt', { time });
+      return null;
     }
   }
 
@@ -1222,6 +1237,10 @@ export class Player {
     return this.firstTimestamp + clamp(time, 0, this.duration);
   }
 
+  private toLookupMediaTime(time: number): number {
+    return this.toMediaTime(this.clampToPlaybackRange(time));
+  }
+
   private fromMediaTime(time: number): number {
     return clamp(time - this.firstTimestamp, 0, this.duration);
   }
@@ -1261,6 +1280,10 @@ export class Player {
 
   private frameKey(time: number): number {
     return Math.round(time * 1e6);
+  }
+
+  get visibleFrameTime(): number {
+    return this.lastDrawnMediaTime === null ? this.currentTime : this.fromMediaTime(this.lastDrawnMediaTime);
   }
 
   private get playbackRate(): number {
