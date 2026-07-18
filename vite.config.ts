@@ -1,4 +1,5 @@
 import { defineConfig } from 'vite';
+import { resolve } from 'node:path';
 
 // `base: './'` keeps all asset URLs relative, so the same build works both
 // at a domain root (local `vite preview`) and under a GitHub Pages subpath
@@ -7,5 +8,6 @@ export default defineConfig({
   base: './',
   build: {
     target: 'es2022',
+    rollupOptions: { input: { main: resolve(__dirname, 'index.html'), cutTest: resolve(__dirname, 'cut-test.html') } },
   },
 });

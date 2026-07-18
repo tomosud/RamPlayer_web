@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Scene Detection Review Test</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui}body{margin:0;background:#101114;color:#eee}main{max-width:1400px;margin:auto;padding:20px}h1{font-size:1.3rem}.panel{padding:14px;background:#1b1d22;border-radius:8px}.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:end}label{display:grid;gap:4px;font-size:.78rem;color:#bbb}input,select,button{font:inherit;padding:6px;background:#101114;color:#fff;border:1px solid #444;border-radius:4px}input[type=number]{width:6em}button{background:#397cf6;border:0;padding:8px 12px;cursor:pointer}button.secondary{background:#555}button:disabled{opacity:.45}progress{width:100%;margin-top:12px}.status{white-space:pre-wrap;color:#b9d3ff}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:7px}.metric{padding:7px;background:#111318}.metric b{display:block;font-size:1.05rem}.review{display:grid;grid-template-columns:minmax(360px,2fr) minmax(330px,1fr);gap:14px;margin-top:14px}video{width:100%;max-height:440px;background:#000}.cuts{max-height:500px;overflow:auto}.cut{display:grid;grid-template-columns:7em 6em 1fr;gap:6px;align-items:center;padding:5px}.cut:nth-child(odd){background:#15171b}.cut.selected{outline:1px solid #397cf6}.cut button{padding:4px 7px;font-size:.75rem}.verdict{display:flex;gap:4px}.correct{background:#287a46}.wrong{background:#9b3939}.unset{background:#555}@media(max-width:850px){.review{grid-template-columns:1fr}}
+</style></head>
+<body><main><h1>CPU / WebGPU カット検出・目視確認テスト</h1><section class="panel"><div class="controls">
+<label>動画<input id="file" type="file" accept="video/*,.mp4,.mov,.webm,.mkv"></label>
+<label>解析方式<select id="mode"><option value="gpu-all">GPU・全フレーム</option><option value="cpu-all">CPU・全フレーム</option><option value="gpu-two-stage" selected>GPU・二段階</option><option value="cpu-two-stage">CPU・二段階</option></select></label>
+<label>グリッド<select id="grid"><option value="32x18">32×18</option><option value="64x36" selected>64×36</option><option value="96x54">96×54</option><option value="128x72">128×72</option></select></label>
+<label>カット閾値<input id="threshold" type="number" min="0" max="100" step="0.5" value="20"></label>
+<label>粗間隔（秒）<input id="coarseInterval" type="number" min="0.1" step="0.1" value="0.5"></label>
+<label>細間隔（秒）<input id="fineInterval" type="number" min="0.02" step="0.02" value="0.1"></label>
+<button id="run">解析開始</button><button id="abort" class="secondary" disabled>中止</button><button id="copy" class="secondary" disabled>結果JSONをコピー</button></div>
+<p id="support" class="status">対応状況を確認中…</p><progress id="progress" max="1" value="0"></progress><p id="status" class="status">動画を選択してください。</p><div id="metrics" class="metrics"></div></section>
+<section class="review"><div><video id="preview" controls playsinline></video><p>候補をクリックすると1秒前へ移動します。再生して実際のカットか確認してください。</p></div><div><h2>カット候補 <span id="reviewSummary"></span></h2><div id="cuts" class="cuts"></div></div></section>
+<p>GPUモードはWebGPU非対応時にフォールバックしません。二段階方式は全体を粗く解析し、候補区間だけ細かく再解析します。</p></main><script type="module" src="/src/cut-test.ts"></script></body></html>
