@@ -50,6 +50,8 @@ export interface StepFrame {
   time: number;
   duration: number;
   canvas: HTMLCanvasElement;
+  sourceWidth: number;
+  sourceHeight: number;
 }
 
 type VideoIterator = AsyncGenerator<VideoSample, void, unknown>;
@@ -1073,9 +1075,15 @@ export class Player {
     canvas.height = this.baseRenderHeight;
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('Frame cache canvas context is unavailable.');
-    sample.drawWithFit(ctx, { fit: 'contain' });
+    sample.draw(ctx, 0, 0, canvas.width, canvas.height);
 
-    const cached: StepFrame = { time, duration: sample.duration, canvas };
+    const cached: StepFrame = {
+      time,
+      duration: sample.duration,
+      canvas,
+      sourceWidth: sample.displayWidth,
+      sourceHeight: sample.displayHeight,
+    };
     this.stepFrames.set(key, cached);
     this.insertStepKey(key);
     return cached;
@@ -1285,17 +1293,20 @@ export class Player {
     }
   }
 
-  private resizeOutputCanvas(): void {
-    const mapping = computeViewMapping(this.view, this.sourceWidth, this.sourceHeight, this.baseRenderWidth, this.baseRenderHeight);
-    const width = mapping?.canvasWidth ?? Math.max(1, Math.round(this.view.stageWidth * Math.min(this.view.dpr, 1)));
-    const height = mapping?.canvasHeight ?? Math.max(1, Math.round(this.view.stageHeight * Math.min(this.view.dpr, 1)));
-    if (this.canvas.width !== width) this.canvas.width = width;
-    if (this.canvas.height !== height) this.canvas.height = height;
+  private resizeOutputCanvas(sourceWidth = this.sourceWidth, sourceHeight = this.sourceHeight): void {
+    const mapping = computeViewMapping(this.view, sourceWidth, sourceHeight, this.baseRenderWidth, this.baseRenderHeight);
+    if (!mapping) return;
+    if (this.canvas.width !== mapping.canvasWidth) this.canvas.width = mapping.canvasWidth;
+    if (this.canvas.height !== mapping.canvasHeight) this.canvas.height = mapping.canvasHeight;
+    this.canvas.style.left = `${mapping.displayLeft}px`;
+    this.canvas.style.top = `${mapping.displayTop}px`;
+    this.canvas.style.width = `${mapping.displayWidth}px`;
+    this.canvas.style.height = `${mapping.displayHeight}px`;
   }
 
   private drawSample(sample: VideoSample): void {
-    const mapping = computeViewMapping(this.view, this.sourceWidth, this.sourceHeight, this.baseRenderWidth, this.baseRenderHeight);
-    this.resizeOutputCanvas();
+    const mapping = computeViewMapping(this.view, sample.displayWidth, sample.displayHeight, this.baseRenderWidth, this.baseRenderHeight);
+    this.resizeOutputCanvas(sample.displayWidth, sample.displayHeight);
     this.ctx2d.clearRect(0, 0, this.canvas.width, this.canvas.height);
     if (!mapping) return;
     sample.draw(this.ctx2d, mapping.sx, mapping.sy, mapping.sw, mapping.sh, mapping.dx, mapping.dy, mapping.dw, mapping.dh);
@@ -1315,13 +1326,13 @@ export class Player {
   }
 
   private blitStepFrame(frame: StepFrame): void {
-    const mapping = computeViewMapping(this.view, this.sourceWidth, this.sourceHeight, this.baseRenderWidth, this.baseRenderHeight);
-    this.resizeOutputCanvas();
+    const mapping = computeViewMapping(this.view, frame.sourceWidth, frame.sourceHeight, this.baseRenderWidth, this.baseRenderHeight);
+    this.resizeOutputCanvas(frame.sourceWidth, frame.sourceHeight);
     this.ctx2d.clearRect(0, 0, this.canvas.width, this.canvas.height);
     if (!mapping || !this.canDrawSource(frame.canvas, 'step')) return;
     try {
-      const sxScale = frame.canvas.width / this.sourceWidth;
-      const syScale = frame.canvas.height / this.sourceHeight;
+      const sxScale = frame.canvas.width / frame.sourceWidth;
+      const syScale = frame.canvas.height / frame.sourceHeight;
       this.ctx2d.drawImage(frame.canvas, mapping.sx * sxScale, mapping.sy * syScale,
         mapping.sw * sxScale, mapping.sh * syScale, mapping.dx, mapping.dy, mapping.dw, mapping.dh);
     } catch (error) {

@@ -11,10 +11,13 @@ export interface ViewMapping {
   sx: number; sy: number; sw: number; sh: number;
   dx: number; dy: number; dw: number; dh: number;
   canvasWidth: number; canvasHeight: number;
+  displayWidth: number; displayHeight: number;
+  displayLeft: number; displayTop: number;
 }
 
 const finitePositive = (value: number) => Number.isFinite(value) && value > 0;
 
+/** Maps the complete video to a movable, variable-size canvas in the UI stage. */
 export function computeViewMapping(
   view: ViewState,
   sourceWidth: number,
@@ -28,27 +31,33 @@ export function computeViewMapping(
       !finitePositive(baseDisplayWidth) || !finitePositive(baseDisplayHeight) ||
       !Number.isFinite(view.panX) || !Number.isFinite(view.panY)) return null;
 
-  const dispW = baseDisplayWidth * view.scale;
-  const dispH = baseDisplayHeight * view.scale;
-  const rectL = view.stageWidth / 2 + view.panX - dispW / 2;
-  const rectT = view.stageHeight / 2 + view.panY - dispH / 2;
-  const left = Math.max(0, rectL);
-  const top = Math.max(0, rectT);
-  const right = Math.min(view.stageWidth, rectL + dispW);
-  const bottom = Math.min(view.stageHeight, rectT + dispH);
-  if (right <= left || bottom <= top) return null;
+  const baseScale = Math.min(baseDisplayWidth / sourceWidth, baseDisplayHeight / sourceHeight);
+  const displayWidth = sourceWidth * baseScale * view.scale;
+  const displayHeight = sourceHeight * baseScale * view.scale;
+  const renderScale = Math.min(
+    view.dpr,
+    sourceWidth / displayWidth,
+    sourceHeight / displayHeight,
+    3840 / displayWidth,
+    2160 / displayHeight,
+  );
+  const canvasWidth = Math.max(1, Math.round(displayWidth * renderScale));
+  const canvasHeight = Math.max(1, Math.round(displayHeight * renderScale));
 
-  const renderDpr = Math.min(view.dpr, 3840 / view.stageWidth, 2160 / view.stageHeight);
   return {
-    sx: ((left - rectL) / dispW) * sourceWidth,
-    sy: ((top - rectT) / dispH) * sourceHeight,
-    sw: ((right - left) / dispW) * sourceWidth,
-    sh: ((bottom - top) / dispH) * sourceHeight,
-    dx: left * renderDpr,
-    dy: top * renderDpr,
-    dw: (right - left) * renderDpr,
-    dh: (bottom - top) * renderDpr,
-    canvasWidth: Math.max(1, Math.round(view.stageWidth * renderDpr)),
-    canvasHeight: Math.max(1, Math.round(view.stageHeight * renderDpr)),
+    sx: 0,
+    sy: 0,
+    sw: sourceWidth,
+    sh: sourceHeight,
+    dx: 0,
+    dy: 0,
+    dw: canvasWidth,
+    dh: canvasHeight,
+    canvasWidth,
+    canvasHeight,
+    displayWidth,
+    displayHeight,
+    displayLeft: view.stageWidth / 2 + view.panX - displayWidth / 2,
+    displayTop: view.stageHeight / 2 + view.panY - displayHeight / 2,
   };
 }
