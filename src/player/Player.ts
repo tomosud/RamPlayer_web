@@ -426,6 +426,25 @@ export class Player {
     this.blit(sample);
   }
 
+  async captureVisibleFramePng(): Promise<Blob> {
+    if (!this.detailSink) throw new Error('No video frame is available.');
+    const sample = await this.detailSink.getSample(this.toLookupMediaTime(this.visibleFrameTime));
+    if (!sample) throw new Error('The displayed frame could not be decoded.');
+    try {
+      const output = document.createElement('canvas');
+      output.width = sample.displayWidth;
+      output.height = sample.displayHeight;
+      const ctx = output.getContext('2d');
+      if (!ctx) throw new Error('PNG canvas context is unavailable.');
+      sample.draw(ctx, 0, 0, output.width, output.height);
+      const blob = await new Promise<Blob | null>((resolve) => output.toBlob(resolve, 'image/png'));
+      if (!blob) throw new Error('The PNG image could not be created.');
+      return blob;
+    } finally {
+      sample.close();
+    }
+  }
+
   private restoreOptimizedCanvas(): void {
     this.pausedDetailGen++;
   }

@@ -44,9 +44,16 @@
       <div id="scaleContextMenu" class="context-menu" hidden>
         <button data-scale="fit">Fit</button>
         <button data-scale="0.1">10%</button>
+        <button data-scale="0.125">12.5%</button>
         <button data-scale="0.25">25%</button>
+        <button data-scale="0.33">33%</button>
         <button data-scale="0.5">50%</button>
+        <button data-scale="0.67">67%</button>
+        <button data-scale="0.75">75%</button>
         <button data-scale="1">100%</button>
+        <button data-scale="1.25">125%</button>
+        <button data-scale="1.5">150%</button>
+        <button data-scale="2">200%</button>
         <button data-scale="custom" disabled>Custom</button>
       </div>
 
@@ -57,7 +64,7 @@
           <canvas id="timeline" class="timeline"></canvas>
         </div>
 
-        <div class="filmstrip-wrap">
+        <div id="filmstripWrap" class="filmstrip-wrap">
           <canvas id="filmstrip" class="filmstrip"></canvas>
         </div>
 
@@ -109,9 +116,16 @@
             <select id="viewScale">
               <option value="fit">Fit</option>
               <option value="0.1">10%</option>
+              <option value="0.125">12.5%</option>
               <option value="0.25">25%</option>
+              <option value="0.33">33%</option>
               <option value="0.5">50%</option>
+              <option value="0.67">67%</option>
+              <option value="0.75">75%</option>
               <option value="1">100%</option>
+              <option value="1.25">125%</option>
+              <option value="1.5">150%</option>
+              <option value="2">200%</option>
               <option value="custom" disabled>Custom</option>
             </select>
           </label>
@@ -119,7 +133,7 @@
           <button id="resetViewBtn" title="Reset video view">Default</button>
 
           <div id="volumePopover" class="volume-popover">
-            <button id="volumeToggle" title="Volume" aria-expanded="false" aria-controls="volumePanel">Vol</button>
+            <button id="volumeToggle" title="Volume" aria-label="Volume" aria-expanded="false" aria-controls="volumePanel">&#128266;</button>
             <div id="volumePanel" class="volume-panel" hidden>
               <label class="vol">
                 Volume <input id="volume" type="range" min="0" max="1" step="0.01" value="1" />
@@ -160,6 +174,7 @@
           </details>
         </div>
         <button id="advancedBtn" class="advanced-btn" title="Advanced features" aria-label="Advanced features" aria-expanded="false">&#9881;</button>
+        <button id="captureFrameBtn" class="capture-frame-btn" title="Save displayed frame as full-resolution PNG" aria-label="Save displayed frame as PNG">PNG</button>
         <button id="closeUiBtn" class="collapse-ui-btn" title="Hide controls" aria-label="Hide controls">▼</button>
       </section>
 

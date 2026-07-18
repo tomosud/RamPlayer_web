@@ -1,5 +1,6 @@
 :root {
   --bg: #0b0d10;
+  --chrome-panel: rgba(11, 13, 16, 0.3);
   --panel: rgba(16, 19, 24, 0.72);
   --panel-solid: rgba(17, 20, 27, 0.74);
   --panel-2: rgba(36, 41, 54, 0.76);
@@ -50,9 +51,16 @@ body {
   align-items: center;
   gap: 12px;
   padding: 0 18px;
-  background: rgba(11, 13, 16, 0.42);
+  background: var(--chrome-panel);
   border-bottom: 1px solid rgba(154, 163, 178, 0.09);
   backdrop-filter: blur(10px);
+  transition: opacity 120ms ease, visibility 120ms ease;
+}
+
+.topbar.is-video-overlap {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .brand {
@@ -96,13 +104,9 @@ body {
 
 .stage {
   position: fixed;
-  inset: 34px 0 0;
+  inset: 0;
   overflow: hidden;
-  background:
-    linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px),
-    #050608;
-  background-size: 28px 28px;
+  background: #000;
   cursor: grab;
   touch-action: none;
   user-select: none;
@@ -287,7 +291,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 5px;
-  background: var(--panel);
+  background: var(--chrome-panel);
   border: 1px solid var(--border);
   border-radius: 8px;
   box-shadow: 0 14px 54px rgba(0, 0, 0, 0.36);
@@ -321,6 +325,25 @@ body {
   border-radius: 50%;
   color: var(--muted);
   background: rgba(36, 41, 54, 0.72);
+}
+
+.capture-frame-btn {
+  position: absolute;
+  z-index: 2;
+  right: 8px;
+  top: 38px;
+  width: 24px;
+  min-height: 24px;
+  padding: 0;
+  border-radius: 50%;
+  color: var(--muted);
+  background: rgba(36, 41, 54, 0.72);
+  font-size: 8px;
+  font-weight: 700;
+}
+
+.capture-frame-btn:hover:not(:disabled) {
+  color: var(--text);
 }
 
 .advanced-popover {
@@ -430,6 +453,13 @@ body {
   display: inline-flex;
   align-items: center;
   margin-left: auto;
+}
+
+#volumeToggle {
+  width: 30px;
+  padding: 0;
+  font-size: 15px;
+  line-height: 1;
 }
 
 .volume-panel {
@@ -590,6 +620,8 @@ button.active {
   background: #0d1015;
   border: 1px solid var(--border);
   border-radius: 6px;
+  cursor: pointer;
+  touch-action: none;
 }
 
 .info-row {

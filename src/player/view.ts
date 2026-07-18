@@ -22,18 +22,16 @@ export function computeViewMapping(
   view: ViewState,
   sourceWidth: number,
   sourceHeight: number,
-  baseDisplayWidth: number,
-  baseDisplayHeight: number,
+  _baseDisplayWidth: number,
+  _baseDisplayHeight: number,
 ): ViewMapping | null {
   if (!finitePositive(view.scale) || !finitePositive(view.stageWidth) ||
       !finitePositive(view.stageHeight) || !finitePositive(view.dpr) ||
       !finitePositive(sourceWidth) || !finitePositive(sourceHeight) ||
-      !finitePositive(baseDisplayWidth) || !finitePositive(baseDisplayHeight) ||
       !Number.isFinite(view.panX) || !Number.isFinite(view.panY)) return null;
 
-  const baseScale = Math.min(baseDisplayWidth / sourceWidth, baseDisplayHeight / sourceHeight);
-  const displayWidth = sourceWidth * baseScale * view.scale;
-  const displayHeight = sourceHeight * baseScale * view.scale;
+  const displayWidth = sourceWidth * view.scale;
+  const displayHeight = sourceHeight * view.scale;
   const renderScale = Math.min(
     view.dpr,
     sourceWidth / displayWidth,

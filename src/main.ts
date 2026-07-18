@@ -39,6 +39,7 @@ const timelinePreview = $<HTMLDivElement>('timelinePreview');
 const timelinePreviewCanvas = $<HTMLCanvasElement>('timelinePreviewCanvas');
 const timelinePreviewTime = $<HTMLSpanElement>('timelinePreviewTime');
 const scaleContextMenu = $<HTMLDivElement>('scaleContextMenu');
+const filmstripWrap = $<HTMLDivElement>('filmstripWrap');
 const filmstripCanvas = $<HTMLCanvasElement>('filmstrip');
 const curTimeEl = $<HTMLSpanElement>('curTime');
 const totalTimeEl = $<HTMLSpanElement>('totalTime');
@@ -59,6 +60,7 @@ const volumePopover = $<HTMLDivElement>('volumePopover');
 const volumeToggle = $<HTMLButtonElement>('volumeToggle');
 const volumePanel = $<HTMLDivElement>('volumePanel');
 const advancedBtn = $<HTMLButtonElement>('advancedBtn');
+const captureFrameBtn = $<HTMLButtonElement>('captureFrameBtn');
 const advancedPopover = $<HTMLDivElement>('advancedPopover');
 const advancedCloseBtn = $<HTMLButtonElement>('advancedCloseBtn');
 const moonshineToggleBtn = $<HTMLButtonElement>('moonshineToggleBtn');
@@ -104,6 +106,7 @@ const controlButtons = [
   clearInOutBtn,
   loopBtn,
   exportClipBtn,
+  captureFrameBtn,
 ];
 
 let currentHandle: FileSystemFileHandle | null = null;
@@ -118,6 +121,7 @@ let videoPanX = 0;
 let videoPanY = 0;
 let pausedDetailTimer = 0;
 let stageDrag: { pointerId: number; x: number; y: number } | null = null;
+let filmstripWheelDelta = 0;
 let thumbGen = 0;
 let timelineThumbnails: TimelineThumbnail[] = [];
 let timelineThumbnailCache = new Map<string, TimelineThumbnail>();
@@ -919,12 +923,12 @@ function blurControl(el: HTMLElement): void {
 }
 
 function fitScale(): number {
-  if (!player.baseDisplayWidth || !player.baseDisplayHeight) return 1;
+  if (!info?.width || !info.height) return 1;
   const rect = stage.getBoundingClientRect();
   const inset = 32;
   const availableW = Math.max(1, rect.width - inset);
   const availableH = Math.max(1, rect.height - inset);
-  return Math.min(availableW / player.baseDisplayWidth, availableH / player.baseDisplayHeight);
+  return Math.min(availableW / info.width, availableH / info.height);
 }
 
 function syncScaleSelect(): void {
@@ -932,10 +936,22 @@ function syncScaleSelect(): void {
     viewScale.value = 'fit';
     return;
   }
-  const fixed = ['0.1', '0.25', '0.5', '1'];
+  const fixed = ['0.1', '0.125', '0.25', '0.33', '0.5', '0.67', '0.75', '1', '1.25', '1.5', '2'];
   const nearest = fixed.find((v) => Math.abs(Number(v) - videoScale) < 0.001);
   if (nearest) viewScale.value = nearest;
   else viewScale.value = 'custom';
+}
+
+function syncTopbarVideoOverlap(): void {
+  if (!player.loaded) {
+    topbar.classList.remove('is-video-overlap');
+    return;
+  }
+  const videoRect = canvas.getBoundingClientRect();
+  const topbarRect = topbar.getBoundingClientRect();
+  const overlaps = videoRect.left < topbarRect.right && videoRect.right > topbarRect.left
+    && videoRect.top < topbarRect.bottom && videoRect.bottom > topbarRect.top;
+  topbar.classList.toggle('is-video-overlap', overlaps);
 }
 
 function applyVideoView(): void {
@@ -949,6 +965,7 @@ function applyVideoView(): void {
     dpr: Math.max(1, window.devicePixelRatio || 1),
   });
   syncScaleSelect();
+  syncTopbarVideoOverlap();
   window.clearTimeout(pausedDetailTimer);
   if (player.loaded && !player.playing) {
     pausedDetailTimer = window.setTimeout(() => {
@@ -1209,6 +1226,32 @@ function renderFilmstrip(frames: StepFrame[], currentTime: number): void {
     ctx.lineWidth = slot === centerSlot ? 2 : 1;
     ctx.strokeRect(x + 0.5, y + 0.5, slotW - 1, slotH - 1);
   }
+}
+
+function filmstripFrameAt(clientX: number): StepFrame | null {
+  const frames = player.stepStripFrames();
+  if (frames.length === 0) return null;
+
+  const visibleSlots = 21;
+  const centerSlot = Math.floor(visibleSlots / 2);
+  const gap = 4;
+  const width = filmstripCanvas.clientWidth || 1;
+  const slotW = Math.max(28, (width - gap * (visibleSlots + 1)) / visibleSlots);
+  const localX = clientX - filmstripCanvas.getBoundingClientRect().left - gap;
+  if (localX < 0) return null;
+  const slot = Math.floor(localX / (slotW + gap));
+  if (slot < 0 || slot >= visibleSlots || localX - slot * (slotW + gap) > slotW) return null;
+
+  let nearestIndex = 0;
+  let nearestDistance = Infinity;
+  for (let i = 0; i < frames.length; i++) {
+    const distance = Math.abs(frames[i].time - player.visibleFrameTime);
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      nearestIndex = i;
+    }
+  }
+  return frames[nearestIndex + slot - centerSlot] ?? null;
 }
 
 function setAdvancedOpen(open: boolean): void {
@@ -1483,6 +1526,7 @@ const player = new Player(canvas, {
   },
   onState(playing) {
     playPauseBtn.textContent = playing ? 'Pause' : 'Play';
+    filmstripWrap.hidden = playing;
     if (moonshineEnabled) {
       moonshineStatus.textContent = playing
         ? 'Listening and generating English captions.'
@@ -1569,7 +1613,7 @@ function uiLoop(now: number): void {
       ranges: isNormalPlayback ? [] : player.cacheRanges(),
       decodingFrom: isNormalPlayback ? 0 : player.decodingFrom,
       decodingTo: isNormalPlayback ? 0 : player.decodingTo,
-      thumbnails: isNormalPlayback ? [] : timelineThumbnails,
+      thumbnails: timelineThumbnails,
     });
     if (!isNormalPlayback) {
       scheduleTimelineThumbnails();
@@ -1644,6 +1688,30 @@ stage.addEventListener('contextmenu', (e) => {
 for (const c of [canvas, timelineCanvas, filmstripCanvas, timelinePreviewCanvas]) {
   c.addEventListener('contextmenu', (e) => e.preventDefault());
 }
+
+filmstripCanvas.addEventListener('pointerdown', (e) => e.stopPropagation());
+filmstripCanvas.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (!player.loaded || exportRunning) return;
+  const frame = filmstripFrameAt(e.clientX);
+  if (!frame) return;
+  pauseTimelineThumbnailWork(700);
+  void player.seek(frame.time);
+});
+filmstripCanvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  if (!player.loaded || exportRunning) return;
+  const delta = e.deltaY * (e.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : e.deltaMode === WheelEvent.DOM_DELTA_PAGE ? 120 : 1);
+  if (filmstripWheelDelta !== 0 && Math.sign(delta) !== Math.sign(filmstripWheelDelta)) filmstripWheelDelta = 0;
+  filmstripWheelDelta += delta;
+  if (Math.abs(filmstripWheelDelta) < 30) return;
+  const direction = filmstripWheelDelta > 0 ? 1 : -1;
+  filmstripWheelDelta = 0;
+  pauseTimelineThumbnailWork(700);
+  if (direction > 0) void player.stepForward();
+  else void player.stepBackward();
+}, { passive: false });
 
 stage.addEventListener('wheel', (e) => {
   if (!player.loaded || exportRunning) return;
@@ -1911,6 +1979,29 @@ scaleContextMenu.addEventListener('click', (e) => {
   blurControl(button);
 });
 resetViewBtn.addEventListener('click', () => resetLayout());
+captureFrameBtn.addEventListener('click', () => void saveDisplayedFrame());
+
+async function saveDisplayedFrame(): Promise<void> {
+  if (!player.loaded || captureFrameBtn.disabled) return;
+  captureFrameBtn.disabled = true;
+  captureFrameBtn.textContent = '...';
+  try {
+    const blob = await player.captureVisibleFramePng();
+    const baseName = player.fileName.replace(/\.[^.]+$/, '').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_') || 'frame';
+    const frame = frameNumber(player.visibleFrameTime);
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = baseName + '_frame-' + String(frame).padStart(6, '0') + '.png';
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) {
+    showError(error instanceof Error ? error.message : String(error));
+  } finally {
+    captureFrameBtn.textContent = 'PNG';
+    captureFrameBtn.disabled = !player.loaded;
+  }
+}
 closeUiBtn.addEventListener('click', () => {
   topbar.hidden = true;
   app.classList.add('chrome-hidden');
@@ -1925,6 +2016,7 @@ showUiBtn.addEventListener('click', () => {
   topbar.hidden = false;
   app.classList.remove('chrome-hidden');
   floatingUi.hidden = false;
+  syncTopbarVideoOverlap();
   showUiBtn.hidden = true;
   showUiBtn.classList.remove('is-idle');
   stage.classList.remove('cursor-idle');
