@@ -33,9 +33,6 @@
         <input id="filePicker" type="file" accept="video/*,audio/*,.mp4,.mov,.webm,.mkv" hidden />
         <div id="subtitleOverlay" class="subtitle-overlay" translate="yes" lang="en" hidden></div>
         <div id="subtitleTranslationSource" class="subtitle-translation-source" translate="yes" lang="en" hidden></div>
-        <div id="moonshineHost" class="moonshine-host" aria-hidden="true">
-          <audio id="moonshineVideo" preload="auto"></audio>
-        </div>
         <button id="resumeBtn" class="resume-btn" hidden>Reopen previous file</button>
       </div>
 
@@ -153,6 +150,14 @@
             </div>
             <div id="moonshineStatus" class="advanced-status" aria-live="polite">Open a media file to enable.</div>
           </section>
+          <details id="diagnosticsDetails" class="diagnostics-details">
+            <summary>Video diagnostics</summary>
+            <div class="diagnostics-actions">
+              <button id="diagnosticsRefreshBtn">Refresh</button>
+              <button id="diagnosticsCopyBtn">Copy</button>
+            </div>
+            <pre id="diagnosticsOutput">Open a media file to inspect playback.</pre>
+          </details>
         </div>
         <button id="advancedBtn" class="advanced-btn" title="Advanced features" aria-label="Advanced features" aria-expanded="false">&#9881;</button>
         <button id="closeUiBtn" class="collapse-ui-btn" title="Hide controls" aria-label="Hide controls">▼</button>

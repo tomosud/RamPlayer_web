@@ -165,39 +165,65 @@ body {
 
 .subtitle-translation-source {
   position: fixed;
-  z-index: 1;
-  left: 1px;
-  bottom: 1px;
-  width: 16px;
-  height: 8px;
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-  justify-content: flex-end;
-  padding: 0;
-  color: #fff;
+  z-index: 22;
+  width: 300px;
+  max-height: 70vh;
+  overflow: auto;
+  padding: 7px;
+  color: rgba(237, 240, 245, 0.82);
+  background: rgba(9, 11, 15, 0.72);
+  border: 1px solid rgba(154, 163, 178, 0.22);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  backdrop-filter: blur(8px);
+  user-select: text;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(82, 93, 110, 0.72) transparent;
+}
+
+.subtitle-translation-source::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.subtitle-translation-source::-webkit-scrollbar-track {
   background: transparent;
-  border: 0;
-  font-size: 1px;
-  line-height: 1;
-  opacity: 0.01;
-  pointer-events: none;
 }
 
-.subtitle-translation-source .subtitle-cue { margin: 0; }
-.subtitle-translation-source time { display: none; }
-
-.moonshine-host {
-  position: fixed;
-  left: -10000px;
-  top: 0;
-  width: 320px;
-  height: 180px;
-  overflow: hidden;
-  pointer-events: none;
+.subtitle-translation-source::-webkit-scrollbar-thumb {
+  background: rgba(82, 93, 110, 0.68);
+  border-radius: 999px;
 }
 
-.moonshine-host audio { width: 1px; height: 1px; }
+.subtitle-translation-source::-webkit-scrollbar-thumb:hover {
+  background: rgba(108, 121, 142, 0.82);
+}
+
+.subtitle-translation-source::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.subtitle-translation-source .subtitle-cue {
+  display: block;
+  margin: 0 0 3px;
+  padding: 4px 5px;
+  border-radius: 4px;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.subtitle-translation-source .subtitle-cue.is-active {
+  color: #fff;
+  background: rgba(79, 157, 255, 0.22);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.subtitle-translation-source time {
+  color: rgba(156, 167, 184, 0.8);
+  margin-right: 6px;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
 
 .resume-btn,
 .show-ui-btn {
@@ -315,6 +341,41 @@ body {
 .advanced-option-head small,
 .advanced-status { color: var(--muted); font-size: 12px; }
 .advanced-status { min-height: 17px; }
+
+.diagnostics-details {
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px solid rgba(154, 163, 178, 0.18);
+}
+
+.diagnostics-details summary {
+  cursor: pointer;
+  color: var(--text);
+  font-weight: 650;
+  font-size: 12px;
+}
+
+.diagnostics-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin: 8px 0 6px;
+}
+
+.diagnostics-output,
+#diagnosticsOutput {
+  max-height: 260px;
+  margin: 0;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid rgba(154, 163, 178, 0.18);
+  border-radius: 5px;
+  background: rgba(5, 6, 8, 0.7);
+  color: #cdd6e4;
+  font: 11px/1.45 ui-monospace, Consolas, monospace;
+  white-space: pre-wrap;
+  user-select: text;
+}
 
 .subtitle-cue { display: block; margin-bottom: 5px; }
 .subtitle-cue time { color: var(--muted); margin-right: 7px; font-variant-numeric: tabular-nums; }

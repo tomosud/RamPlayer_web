@@ -31,7 +31,6 @@ const dropHint = $<HTMLDivElement>('dropHint');
 const filePicker = $<HTMLInputElement>('filePicker');
 const subtitleOverlay = $<HTMLDivElement>('subtitleOverlay');
 const subtitleTranslationSource = $<HTMLDivElement>('subtitleTranslationSource');
-const moonshineVideo = $<HTMLAudioElement>('moonshineVideo');
 const resumeBtn = $<HTMLButtonElement>('resumeBtn');
 const errorBox = $<HTMLDivElement>('error');
 const filenameEl = $<HTMLDivElement>('filename');
@@ -64,6 +63,10 @@ const advancedPopover = $<HTMLDivElement>('advancedPopover');
 const advancedCloseBtn = $<HTMLButtonElement>('advancedCloseBtn');
 const moonshineToggleBtn = $<HTMLButtonElement>('moonshineToggleBtn');
 const moonshineStatus = $<HTMLDivElement>('moonshineStatus');
+const diagnosticsDetails = $<HTMLDetailsElement>('diagnosticsDetails');
+const diagnosticsRefreshBtn = $<HTMLButtonElement>('diagnosticsRefreshBtn');
+const diagnosticsCopyBtn = $<HTMLButtonElement>('diagnosticsCopyBtn');
+const diagnosticsOutput = $<HTMLPreElement>('diagnosticsOutput');
 
 const playPauseBtn = $<HTMLButtonElement>('playPause');
 const prevFrameBtn = $<HTMLButtonElement>('prevFrame');
@@ -135,13 +138,13 @@ let exportRunning = false;
 let exportAbortController: AbortController | null = null;
 let exportCopyCheckGen = 0;
 let showUiIdleTimer = 0;
-let moonshineObjectUrl: string | null = null;
 let moonshineLoaded = false;
 let moonshineEnabled = false;
 let moonshineStarting = false;
-let moonshinePlayPending = false;
 let lastMoonshineText = '';
 let lastMoonshineCueAt = -1;
+let lastDiagnosticsUpdate = 0;
+let lastUiRenderAt = 0;
 interface SubtitleCue {
   time: number;
   original: string;
@@ -149,9 +152,19 @@ interface SubtitleCue {
 }
 
 let subtitleCues: SubtitleCue[] = [];
+let activeSubtitleCue: SubtitleCue | null = null;
+let subtitlePreparing = false;
+
+interface MoonshineTranscriber {
+  isActive: boolean;
+  attachStream(stream: MediaStream): void;
+  start(): Promise<void>;
+  stop(): void;
+}
+
+let moonshineTranscriber: MoonshineTranscriber | null = null;
 
 const moonshineUrl = 'https://cdn.jsdelivr.net/npm/@moonshine-ai/moonshine-js@0.1.29/dist/moonshine.min.js';
-const moonshineLeadSeconds = 3;
 
 const timelineThumbWidth = 96;
 const timelineThumbHeight = 54;
@@ -238,6 +251,63 @@ function exportPlan(bitrateScale: number): { videoBitrate: number; audioBitrate:
 function frameNumber(t: number): number {
   if (!info) return 0;
   return Math.max(0, Math.floor(t * info.fps + 1e-6));
+}
+
+function buildDiagnosticsText(): string {
+  if (!info) return 'Open a media file to inspect playback.';
+  const d = player.getDiagnostics();
+  const nav = navigator as Navigator & { deviceMemory?: number };
+  const perf = performance as Performance & {
+    memory?: { usedJSHeapSize: number; totalJSHeapSize: number; jsHeapSizeLimit: number };
+  };
+  const heap = perf.memory;
+  const lines = [
+    `Captured: ${new Date().toISOString()}`,
+    '',
+    '[Media / Mediabunny]',
+    `File: ${currentFile?.name ?? info.name}`,
+    `File size: ${currentFile ? fmtBytes(currentFile.size) : 'unknown'}`,
+    `Duration: ${fmt(info.duration)}`,
+    `Video: ${info.width}x${info.height} @ ${fmtFps(info.fps)} fps`,
+    `Playback canvas: ${info.renderWidth ?? info.width}x${info.renderHeight ?? info.height}`,
+    `Video codec: ${info.videoCodec ?? 'none/unknown'}`,
+    `Audio codec: ${info.audioCodec ?? 'none/unknown'}`,
+    `Audio sample rate: ${info.audioSampleRate ? `${info.audioSampleRate} Hz` : 'none/unknown'}`,
+    '',
+    '[Playback]',
+    `State: ${d.startingPlayback ? 'starting' : d.playing ? 'playing' : 'paused'}`,
+    `Seeking: ${d.seeking}`,
+    `Current / visible: ${d.currentTime.toFixed(3)} / ${d.visibleFrameTime.toFixed(3)} sec`,
+    `Video iterator: ${d.hasVideoIterator ? 'active' : 'none'} (generation ${d.asyncId})`,
+    `Step-frame prefetch: ${d.stepPrefetchRunning ? 'active' : 'stopped'}`,
+    `Audio context: ${d.audioContextState} @ ${d.audioContextTime.toFixed(3)} sec`,
+    `Audio sink / iterator: ${d.hasAudioSink} / ${d.hasAudioIterator}`,
+    `Audio capture tracks: ${d.audioCaptureTracks}`,
+    `Queued audio nodes: ${d.queuedAudioNodes}`,
+    `Decoded cache: ${d.cacheFrames} frames, ${fmtBytes(d.cacheBytes)} / ${fmtBytes(d.cacheBudgetBytes)}`,
+    `Decode range: ${d.decodingFrom.toFixed(3)} - ${d.decodingTo.toFixed(3)} sec`,
+    '',
+    '[Moonshine]',
+    `Enabled / model loaded: ${moonshineEnabled} / ${moonshineLoaded}`,
+    `Transcriber: ${moonshineTranscriber?.isActive ? 'active' : 'stopped'}`,
+    'Inference mode: VAD stable commits (non-streaming)',
+    'Audio source: Player AudioContext capture stream (no second media decoder)',
+    `Stable cues: ${subtitleCues.length}`,
+    '',
+    '[Browser / device]',
+    `Viewport: ${window.innerWidth}x${window.innerHeight} @ ${window.devicePixelRatio}x DPR`,
+    `Screen: ${screen.width}x${screen.height}`,
+    `Logical CPUs: ${navigator.hardwareConcurrency ?? 'unknown'}`,
+    `Device memory: ${nav.deviceMemory ? `${nav.deviceMemory} GB` : 'unknown'}`,
+    `JS heap: ${heap ? `${fmtBytes(heap.usedJSHeapSize)} / ${fmtBytes(heap.jsHeapSizeLimit)}` : 'unavailable'}`,
+    `User agent: ${navigator.userAgent}`,
+  ];
+  return lines.join('\n');
+}
+
+function updateDiagnostics(): void {
+  diagnosticsOutput.textContent = buildDiagnosticsText();
+  lastDiagnosticsUpdate = performance.now();
 }
 
 function totalFrames(): number {
@@ -499,7 +569,7 @@ function thumbnailQueueForJobs(jobs: ThumbnailJob[]): ThumbnailWork[] {
 }
 
 function scheduleTimelineThumbnails(force = false): void {
-  if (!info || !player.loaded) return;
+  if (!info || !player.loaded || player.playing || player.startingPlayback) return;
   const now = performance.now();
   const jobs = visibleThumbnailJobs();
   if (jobs.length === 0) return;
@@ -966,7 +1036,10 @@ function updateMediaInfo(): void {
   const playback = player.playbackFps == null
     ? 'play original'
     : `play ${fmtFps(player.effectivePlaybackFps)}fps`;
-  mediaInfo.textContent = `${fmt(info.duration)} / ${info.width}x${info.height} / ${fmtFps(info.fps)}fps source / ${playback} / ${
+  const renderSize = info.renderWidth && info.renderHeight && (info.renderWidth !== info.width || info.renderHeight !== info.height)
+    ? ` / ${info.renderWidth}x${info.renderHeight} render`
+    : '';
+  mediaInfo.textContent = `${fmt(info.duration)} / ${info.width}x${info.height}${renderSize} / ${fmtFps(info.fps)}fps source / ${playback} / ${
     info.hasAudio ? 'audio' : 'no audio'
   }`;
 }
@@ -1129,13 +1202,10 @@ function setAdvancedOpen(open: boolean): void {
   advancedBtn.setAttribute('aria-expanded', String(open));
 }
 
-function resetMoonshineForFile(file: File, hasAudio: boolean): void {
-  moonshineVideo.pause();
-  if (moonshineObjectUrl) URL.revokeObjectURL(moonshineObjectUrl);
-  moonshineObjectUrl = URL.createObjectURL(file);
-  moonshineVideo.src = moonshineObjectUrl;
-  moonshineVideo.muted = false;
-  moonshineVideo.load();
+function resetMoonshineForFile(_file: File, hasAudio: boolean): void {
+  moonshineTranscriber?.stop();
+  moonshineTranscriber = null;
+  moonshineLoaded = false;
   moonshineEnabled = false;
   lastMoonshineText = '';
   lastMoonshineCueAt = -1;
@@ -1144,6 +1214,8 @@ function resetMoonshineForFile(file: File, hasAudio: boolean): void {
   subtitleTranslationSource.replaceChildren();
   subtitleTranslationSource.hidden = true;
   subtitleCues = [];
+  activeSubtitleCue = null;
+  subtitlePreparing = false;
   moonshineToggleBtn.disabled = !hasAudio;
   moonshineToggleBtn.textContent = 'Start';
   moonshineStatus.textContent = hasAudio
@@ -1155,13 +1227,14 @@ function normalizeCaptionText(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
 }
 
-function commitMoonshineCaption(value: string): void {
+function commitMoonshineCaption(value: string, cueTime = player.currentTime): void {
   const text = normalizeCaptionText(value);
   if (!moonshineEnabled || text.length < 2 || text.length > 600 || text === lastMoonshineText) return;
   if (/^(loading|download|model|moonshine|\d{1,3}%)\b/i.test(text)) return;
 
   lastMoonshineText = text;
-  const cueAt = Math.max(0, moonshineVideo.currentTime || player.currentTime + moonshineLeadSeconds);
+  subtitlePreparing = false;
+  const cueAt = Math.max(0, cueTime);
   if (Math.abs(cueAt - lastMoonshineCueAt) < 0.2) {
     const translationLast = subtitleTranslationSource.lastElementChild?.querySelector('.subtitle-cue-text');
     if (translationLast) translationLast.textContent = text;
@@ -1182,7 +1255,7 @@ function commitMoonshineCaption(value: string): void {
   const translationWords = translationRow.querySelector<HTMLSpanElement>('.subtitle-cue-text');
   if (!translationWords) return;
   subtitleTranslationSource.appendChild(translationRow);
-  while (subtitleTranslationSource.childElementCount > 20) {
+  while (subtitleTranslationSource.childElementCount > 500) {
     subtitleTranslationSource.firstElementChild?.remove();
   }
   subtitleTranslationSource.hidden = false;
@@ -1191,7 +1264,14 @@ function commitMoonshineCaption(value: string): void {
 
 function updateSubtitleOverlayForTime(): void {
   if (!moonshineEnabled) {
+    activeSubtitleCue?.element.closest('.subtitle-cue')?.classList.remove('is-active');
+    activeSubtitleCue = null;
     subtitleOverlay.hidden = true;
+    return;
+  }
+  if (subtitlePreparing) {
+    subtitleOverlay.textContent = 'Preparing subtitles...';
+    subtitleOverlay.hidden = false;
     return;
   }
   const now = player.visibleFrameTime;
@@ -1203,12 +1283,45 @@ function updateSubtitleOverlayForTime(): void {
     }
   }
   if (!active || now - active.time > 7) {
+    if (activeSubtitleCue) activeSubtitleCue.element.closest('.subtitle-cue')?.classList.remove('is-active');
+    activeSubtitleCue = null;
     subtitleOverlay.hidden = true;
     return;
+  }
+  if (activeSubtitleCue !== active) {
+    activeSubtitleCue?.element.closest('.subtitle-cue')?.classList.remove('is-active');
+    active.element.closest('.subtitle-cue')?.classList.add('is-active');
+    activeSubtitleCue = active;
+    const row = active.element.closest<HTMLElement>('.subtitle-cue');
+    if (row) {
+      subtitleTranslationSource.scrollTop = Math.max(0, row.offsetTop - subtitleTranslationSource.clientHeight * 0.42);
+    }
   }
   const translated = normalizeCaptionText(active.element.textContent ?? '');
   subtitleOverlay.textContent = translated || active.original;
   subtitleOverlay.hidden = false;
+}
+
+function positionSubtitleHistory(): void {
+  if (subtitleTranslationSource.hidden) return;
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return;
+  const gap = 10;
+  const availableRight = window.innerWidth - rect.right - gap * 2;
+  const width = Math.max(190, Math.min(360, availableRight));
+  if (availableRight >= 190) {
+    subtitleTranslationSource.style.left = `${rect.right + gap}px`;
+    subtitleTranslationSource.style.right = 'auto';
+    subtitleTranslationSource.style.top = `${Math.max(38, rect.top)}px`;
+    subtitleTranslationSource.style.width = `${width}px`;
+    subtitleTranslationSource.style.maxHeight = `${Math.max(120, Math.min(rect.height, window.innerHeight - Math.max(38, rect.top) - 16))}px`;
+  } else {
+    subtitleTranslationSource.style.left = 'auto';
+    subtitleTranslationSource.style.right = '8px';
+    subtitleTranslationSource.style.top = '42px';
+    subtitleTranslationSource.style.width = `${Math.min(320, window.innerWidth - 16)}px`;
+    subtitleTranslationSource.style.maxHeight = '45vh';
+  }
 }
 
 function positionSubtitleOverlay(): void {
@@ -1227,87 +1340,61 @@ function positionSubtitleOverlay(): void {
   }
 }
 
-function resumeMoonshineAudioContextOnCreate(): void {
-  const audioWindow = window as Window & {
-    webkitAudioContext?: typeof AudioContext;
-  };
-  const OriginalAudioContext = window.AudioContext ?? audioWindow.webkitAudioContext;
-  if (!OriginalAudioContext || typeof Proxy === 'undefined') return;
-  const patched = new Proxy(OriginalAudioContext, {
-    construct(target, args) {
-      const context = Reflect.construct(target, args) as AudioContext;
-      void context.resume().catch(() => undefined);
-      const createMediaElementSource = context.createMediaElementSource.bind(context);
-      context.createMediaElementSource = ((mediaElement: HTMLMediaElement) => {
-        const source = createMediaElementSource(mediaElement);
-        const connect = source.connect.bind(source);
-        source.connect = ((destination: AudioNode, ...args: unknown[]) => {
-          if (destination === context.destination) return destination;
-          return connect(destination, ...(args as []));
-        }) as typeof source.connect;
-        return source;
-      }) as typeof context.createMediaElementSource;
-      if (window.AudioContext === patched) window.AudioContext = OriginalAudioContext;
-      if (audioWindow.webkitAudioContext === patched) audioWindow.webkitAudioContext = OriginalAudioContext;
-      return context;
-    },
-  });
-  if (window.AudioContext) window.AudioContext = patched;
-  if (audioWindow.webkitAudioContext) audioWindow.webkitAudioContext = patched;
-}
-
 async function startMoonshine(): Promise<void> {
   if (!currentFile || moonshineStarting) return;
   moonshineStarting = true;
+  moonshineEnabled = true;
+  subtitlePreparing = true;
+  subtitleOverlay.textContent = 'Preparing subtitles...';
+  subtitleOverlay.hidden = false;
+  positionSubtitleOverlay();
   moonshineToggleBtn.disabled = true;
   moonshineStatus.textContent = moonshineLoaded ? 'Starting transcription...' : 'Downloading Moonshine model...';
   try {
-    if (!moonshineLoaded) {
-      resumeMoonshineAudioContextOnCreate();
+    if (!moonshineTranscriber) {
+      const stream = player.getAudioCaptureStream();
+      if (!stream) throw new Error('The player audio capture stream is unavailable.');
       const Moonshine = await import(/* @vite-ignore */ moonshineUrl) as {
-        MediaElementTranscriber: new (
-          media: HTMLMediaElement,
+        Transcriber: new (
           model: string,
           callbacks: {
             onModelLoadStarted(): void;
             onModelLoaded(): void;
             onTranscriptionUpdated(text: string): void;
-            onTranscriptionCommitted(text: string): void;
+            onTranscriptionCommitted(text: string, buffer?: AudioBuffer): void;
           },
           vad?: boolean,
-        ) => unknown;
+        ) => MoonshineTranscriber;
       };
-      new Moonshine.MediaElementTranscriber(moonshineVideo, 'model/tiny', {
+      moonshineTranscriber = new Moonshine.Transcriber('model/tiny', {
         onModelLoadStarted() {
           moonshineStatus.textContent = 'Downloading Moonshine model...';
         },
         onModelLoaded() {
+          moonshineLoaded = true;
           moonshineStatus.textContent = player.playing
             ? 'Listening and generating English captions.'
             : 'Ready. Play the media to begin transcription.';
         },
-        onTranscriptionUpdated(text) {
-          if (text) moonshineStatus.textContent = 'Listening; waiting for a stable caption...';
+        onTranscriptionUpdated() {
+          // VAD mode only emits committed captions at stable speech boundaries.
         },
-        onTranscriptionCommitted(text) {
-          commitMoonshineCaption(text);
+        onTranscriptionCommitted(text, buffer) {
+          commitMoonshineCaption(text, player.currentTime - (buffer?.duration ?? 0));
         },
-      }, false);
-      moonshineLoaded = true;
+      }, true);
+      moonshineTranscriber.attachStream(stream);
     }
-    moonshineEnabled = true;
-    moonshineVideo.muted = false;
-    moonshineVideo.currentTime = Math.min(player.duration, player.currentTime + moonshineLeadSeconds);
-    moonshineVideo.playbackRate = info
-      ? Math.max(0.25, Math.min(4, (player.getState().playbackFps ?? info.fps) / info.fps))
-      : 1;
-    if (player.playing) await moonshineVideo.play();
+    await moonshineTranscriber.start();
+    if (!player.playing) moonshineTranscriber.stop();
     moonshineToggleBtn.textContent = 'Stop';
     moonshineStatus.textContent = player.playing
       ? 'Listening and generating English captions.'
       : 'Ready. Play the media to begin transcription.';
   } catch (error) {
     moonshineEnabled = false;
+    subtitlePreparing = false;
+    subtitleOverlay.hidden = true;
     moonshineStatus.textContent = `Moonshine failed: ${error instanceof Error ? error.message : String(error)}`;
   } finally {
     moonshineStarting = false;
@@ -1317,32 +1404,27 @@ async function startMoonshine(): Promise<void> {
 
 function stopMoonshine(): void {
   moonshineEnabled = false;
-  moonshinePlayPending = false;
-  moonshineVideo.pause();
+  subtitlePreparing = false;
+  moonshineTranscriber?.stop();
   moonshineToggleBtn.textContent = 'Start';
   moonshineStatus.textContent = 'Stopped. Existing transcript remains available for translation.';
   subtitleOverlay.hidden = true;
+  subtitleTranslationSource.hidden = true;
 }
 
 function syncMoonshinePlayback(): void {
-  if (!moonshineEnabled || !moonshineVideo.src) return;
-  const target = Math.min(player.duration, player.currentTime + moonshineLeadSeconds);
-  if (Math.abs(moonshineVideo.currentTime - target) > 0.45) moonshineVideo.currentTime = target;
-  const rate = info
-    ? Math.max(0.25, Math.min(4, (player.getState().playbackFps ?? info.fps) / info.fps))
-    : 1;
-  if (Math.abs(moonshineVideo.playbackRate - rate) > 0.001) moonshineVideo.playbackRate = rate;
-  if (player.playing && moonshineVideo.paused && !moonshinePlayPending) {
-    moonshinePlayPending = true;
-    void moonshineVideo.play()
+  if (!moonshineEnabled || !moonshineTranscriber || moonshineStarting) return;
+  if (player.playing && !moonshineTranscriber.isActive) {
+    moonshineStarting = true;
+    void moonshineTranscriber.start()
       .catch((error) => {
         moonshineStatus.textContent = `Audio transcription could not start: ${error instanceof Error ? error.message : String(error)}`;
       })
       .finally(() => {
-        moonshinePlayPending = false;
+        moonshineStarting = false;
       });
   }
-  if (!player.playing && !moonshineVideo.paused) moonshineVideo.pause();
+  if (!player.playing && moonshineTranscriber.isActive) moonshineTranscriber.stop();
 }
 
 setControlsEnabled(false);
@@ -1438,26 +1520,37 @@ const timeline = new Timeline(timelineCanvas, {
   },
 });
 
-function uiLoop(): void {
+function uiLoop(now: number): void {
+  const interval = player.loaded && (player.playing || player.startingPlayback) ? 1000 / 15 : 1000 / 30;
+  if (now - lastUiRenderAt < interval) {
+    requestAnimationFrame(uiLoop);
+    return;
+  }
+  lastUiRenderAt = now;
   if (player.loaded) {
     syncMoonshinePlayback();
     updateSubtitleOverlayForTime();
     positionSubtitleOverlay();
+    positionSubtitleHistory();
+    const isNormalPlayback = player.playing || player.startingPlayback;
     timeline.render({
       duration: player.duration,
       currentTime: player.visibleFrameTime,
       inPoint: player.inPoint,
       outPoint: player.outPoint,
-      ranges: player.cacheRanges(),
-      decodingFrom: player.decodingFrom,
-      decodingTo: player.decodingTo,
-      thumbnails: timelineThumbnails,
+      ranges: isNormalPlayback ? [] : player.cacheRanges(),
+      decodingFrom: isNormalPlayback ? 0 : player.decodingFrom,
+      decodingTo: isNormalPlayback ? 0 : player.decodingTo,
+      thumbnails: isNormalPlayback ? [] : timelineThumbnails,
     });
-    scheduleTimelineThumbnails();
-    renderFilmstrip(player.stepStripFrames(), player.visibleFrameTime);
+    if (!isNormalPlayback) {
+      scheduleTimelineThumbnails();
+      renderFilmstrip(player.stepStripFrames(), player.visibleFrameTime);
+    }
     const usedMB = player.cacheBytes / (1024 * 1024);
     const budgetMB = player.cacheBudgetBytes / (1024 * 1024);
     memUsage.textContent = `RAM ${usedMB.toFixed(0)}MB / ${budgetMB.toFixed(0)}MB (${player.cacheFrameCount}f)`;
+    if (diagnosticsDetails.open && performance.now() - lastDiagnosticsUpdate >= 500) updateDiagnostics();
   }
   requestAnimationFrame(uiLoop);
 }
@@ -1739,6 +1832,21 @@ advancedBtn.addEventListener('click', (e) => {
 });
 advancedPopover.addEventListener('click', (e) => e.stopPropagation());
 advancedCloseBtn.addEventListener('click', () => setAdvancedOpen(false));
+diagnosticsDetails.addEventListener('toggle', () => {
+  if (diagnosticsDetails.open) updateDiagnostics();
+});
+diagnosticsRefreshBtn.addEventListener('click', () => updateDiagnostics());
+diagnosticsCopyBtn.addEventListener('click', () => {
+  updateDiagnostics();
+  void navigator.clipboard.writeText(diagnosticsOutput.textContent ?? '')
+    .then(() => {
+      diagnosticsCopyBtn.textContent = 'Copied';
+      window.setTimeout(() => { diagnosticsCopyBtn.textContent = 'Copy'; }, 1200);
+    })
+    .catch((error) => {
+      moonshineStatus.textContent = `Copy failed: ${error instanceof Error ? error.message : String(error)}`;
+    });
+});
 moonshineToggleBtn.addEventListener('click', () => {
   if (moonshineEnabled) stopMoonshine();
   else void startMoonshine();
@@ -1818,7 +1926,7 @@ async function onResume(): Promise<void> {
 setInterval(() => void persistNow(), 2000);
 window.addEventListener('pagehide', () => {
   void persistNow();
-  if (moonshineObjectUrl) URL.revokeObjectURL(moonshineObjectUrl);
+  moonshineTranscriber?.stop();
 });
 
 async function init(): Promise<void> {

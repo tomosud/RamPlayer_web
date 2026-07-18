@@ -16,8 +16,13 @@ export interface LoadedInfo {
   duration: number;
   width: number;
   height: number;
+  renderWidth?: number;
+  renderHeight?: number;
   fps: number;
   hasAudio: boolean;
+  videoCodec?: string;
+  audioCodec?: string;
+  audioSampleRate?: number;
 }
 
 export interface PlayerCallbacks {
@@ -67,6 +72,7 @@ export class Player {
   private audioSink: AudioBufferSink | null = null;
   private audioContext: AudioContext | null = null;
   private gainNode: GainNode | null = null;
+  private audioCaptureDestination: MediaStreamAudioDestinationNode | null = null;
   private videoCanBeTransparent = false;
 
   private raf = 0;
@@ -80,6 +86,8 @@ export class Player {
   private playbackMediaAtStart = 0;
   private audioContextStartTime = 0;
   private lastDrawnMediaTime: number | null = null;
+  private sourceWidth = 1;
+  private sourceHeight = 1;
 
   currentTime = 0;
   duration = 0;
@@ -167,11 +175,11 @@ export class Player {
   }
 
   get interactiveBusy(): boolean {
-    return this.playing || this.seekRunning || this.stepQueueRunning || this.stepDecoding || this.stepPrefetchRunning;
+    return this.playStarting || this.playing || this.seekRunning || this.stepQueueRunning || this.stepDecoding || this.stepPrefetchRunning;
   }
 
   get thumbnailBusy(): boolean {
-    return this.playing || this.seekRunning || this.stepQueueRunning || (this.stepDecoding && !this.stepPrefetchRunning);
+    return this.playStarting || this.playing || this.seekRunning || this.stepQueueRunning || (this.stepDecoding && !this.stepPrefetchRunning);
   }
 
   interruptThumbnailWork(): void {
@@ -202,13 +210,17 @@ export class Player {
     let audioTrack = await input.getPrimaryAudioTrack();
     guardLoad();
 
-    if (videoTrack && (!(await videoTrack.getCodec()) || !(await videoTrack.canDecode()))) {
+    let videoCodec = videoTrack ? await videoTrack.getCodec() : null;
+    let audioCodec = audioTrack ? await audioTrack.getCodec() : null;
+    if (videoTrack && (!videoCodec || !(await videoTrack.canDecode()))) {
       guardLoad();
       videoTrack = null;
+      videoCodec = null;
     }
-    if (audioTrack && (!(await audioTrack.getCodec()) || !(await audioTrack.canDecode()))) {
+    if (audioTrack && (!audioCodec || !(await audioTrack.canDecode()))) {
       guardLoad();
       audioTrack = null;
+      audioCodec = null;
     }
     guardLoad();
     if (!videoTrack && !audioTrack) {
@@ -229,6 +241,8 @@ export class Player {
       this.videoCanBeTransparent = videoCanBeTransparent;
       const displayWidth = await videoTrack.getDisplayWidth();
       const displayHeight = await videoTrack.getDisplayHeight();
+      this.sourceWidth = displayWidth;
+      this.sourceHeight = displayHeight;
       let fps = 30;
       try {
         const stats = await videoTrack.computePacketStats(120);
@@ -237,10 +251,22 @@ export class Player {
         fps = 30;
       }
       guardLoad();
+      const renderScale = Math.min(
+        1,
+        Math.max(640, window.innerWidth) / displayWidth,
+        Math.max(360, window.innerHeight) / displayHeight,
+      );
+      const renderWidth = Math.max(1, Math.round(displayWidth * renderScale));
+      const renderHeight = Math.max(1, Math.round(displayHeight * renderScale));
       this.videoSink = new CanvasSink(videoTrack, {
         poolSize: 2,
+        width: renderWidth,
+        height: renderHeight,
         fit: 'contain',
         alpha: videoCanBeTransparent,
+        decoderOptions: {
+          optimizeForLatency: true,
+        },
       });
       this.thumbnailSink = new CanvasSink(videoTrack, {
         poolSize: 1,
@@ -250,13 +276,15 @@ export class Player {
         alpha: videoCanBeTransparent,
       });
       this.thumbnailPacketSink = new EncodedPacketSink(videoTrack);
-      this.canvas.width = displayWidth;
-      this.canvas.height = displayHeight;
+      this.canvas.width = renderWidth;
+      this.canvas.height = renderHeight;
       this.fps = fps;
     } else {
       guardLoad();
       this.canvas.width = 1;
       this.canvas.height = 1;
+      this.sourceWidth = 1;
+      this.sourceHeight = 1;
       this.videoSink = null;
       this.thumbnailSink = null;
       this.thumbnailPacketSink = null;
@@ -279,6 +307,8 @@ export class Player {
     });
     this.gainNode = this.audioContext.createGain();
     this.gainNode.connect(this.audioContext.destination);
+    this.audioCaptureDestination = this.audioContext.createMediaStreamDestination();
+    this.gainNode.connect(this.audioCaptureDestination);
     this.setVolume(this.volume);
 
     this.audioSink = audioTrack ? new AudioBufferSink(audioTrack) : null;
@@ -296,10 +326,15 @@ export class Player {
     this.callbacks.onLoaded({
       name: this.fileName,
       duration: this.duration,
-      width: this.canvas.width,
-      height: this.canvas.height,
+      width: this.sourceWidth,
+      height: this.sourceHeight,
+      renderWidth: this.canvas.width,
+      renderHeight: this.canvas.height,
       fps: this.fps,
       hasAudio: this.audioSink !== null,
+      videoCodec: videoCodec ?? undefined,
+      audioCodec: audioCodec ?? undefined,
+      audioSampleRate,
     });
     this.callbacks.onInOut(this.inPoint, this.outPoint, this.loop);
 
@@ -350,8 +385,9 @@ export class Player {
       this.audioContextStartTime = this.audioContext.currentTime;
       this.playing = true;
       this.callbacks.onState(true);
-      // 再生に戻ったら予算が小さくなる。一時停止中に広げたキャッシュを再生予算まで縮める。
-      this.evictStepFrames(this.currentTime);
+      // 通常再生ではコマ送りキャッシュを使用しない。特に4Kでは数十枚でも
+      // 数百MBになるため全解放し、一時停止時に必要範囲だけ再構築する。
+      this.clearStepFrames();
 
       if (this.audioSink) {
         void this.audioIterator?.return(undefined);
@@ -683,7 +719,7 @@ export class Player {
   }
 
   private scheduleStepPrefetch(center: number): void {
-    if (!this.videoSink || this.playing) return;
+    if (!this.videoSink || this.playStarting || this.playing) return;
     this.requestedStepPrefetchCenter = this.clampToPlaybackRange(center);
     if (this.stepPrefetchRunning || this.stepQueueRunning || this.seekRunning) return;
     void this.runStepPrefetchLoop();
@@ -698,6 +734,7 @@ export class Player {
       while (
         loopGen === this.stepPrefetchLoopGen &&
         this.videoSink &&
+        !this.playStarting &&
         !this.playing &&
         !this.seekRunning &&
         !this.stepQueueRunning
@@ -726,6 +763,7 @@ export class Player {
         loopGen === this.stepPrefetchLoopGen &&
         this.requestedStepPrefetchCenter !== null &&
         this.videoSink &&
+        !this.playStarting &&
         !this.playing &&
         !this.seekRunning &&
         !this.stepQueueRunning
@@ -1463,6 +1501,36 @@ export class Player {
     };
   }
 
+  getAudioCaptureStream(): MediaStream | null {
+    return this.audioCaptureDestination?.stream ?? null;
+  }
+
+  getDiagnostics() {
+    return {
+      loaded: this.loaded,
+      playing: this.playing,
+      startingPlayback: this.playStarting,
+      seeking: this.seekRunning,
+      currentTime: this.currentTime,
+      visibleFrameTime: this.visibleFrameTime,
+      audioContextState: this.audioContext?.state ?? 'none',
+      audioContextTime: this.audioContext?.currentTime ?? 0,
+      audioSampleRate: this.audioContext?.sampleRate,
+      audioCaptureTracks: this.audioCaptureDestination?.stream.getAudioTracks().length ?? 0,
+      hasAudioSink: this.audioSink !== null,
+      hasAudioIterator: this.audioIterator !== null,
+      queuedAudioNodes: this.queuedAudioNodes.size,
+      hasVideoIterator: this.videoIterator !== null,
+      stepPrefetchRunning: this.stepPrefetchRunning,
+      asyncId: this.asyncId,
+      cacheFrames: this.cacheFrameCount,
+      cacheBytes: this.cacheBytes,
+      cacheBudgetBytes: this.cacheBudgetBytes,
+      decodingFrom: this.decodingFrom,
+      decodingTo: this.decodingTo,
+    };
+  }
+
   async dispose(): Promise<void> {
     this.requestedStepPrefetchCenter = null;
     this.interruptThumbnailWork();
@@ -1483,6 +1551,7 @@ export class Player {
       this.audioContext = null;
     }
     this.audioSink = null;
+    this.audioCaptureDestination = null;
     this.videoSink = null;
     this.thumbnailSink = null;
     this.thumbnailPacketSink = null;
