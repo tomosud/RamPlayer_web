@@ -33,7 +33,8 @@ CSS transform による拡大をやめ、**毎フレーム「見えているソ�
                        │ sample.draw(ctx, sx,sy,sw,sh, dx,dy,dw,dh)
                        ▼
 [canvas] 実解像度 = ステージ表示域 × dpr(上限 3840×2160)
-         CSS上はステージにフィット固定・transformなし
+         CSS上はステージにフィット固定・transformなし・背景透明
+         canvas自体は動かさず、動画矩形だけをパンしてUI内を移動
 ```
 
 ### 3.1 座標系とビューマッピング
@@ -63,7 +64,7 @@ export function computeViewMapping(
   sourceHeight: number,
   baseDisplayWidth: number,  // ロード時に決めた scale=1 の CSS px サイズ
   baseDisplayHeight: number,
-): ViewMapping;
+): ViewMapping | null; // 完全に画面外、または不正入力なら null
 ```
 
 計算(すべて純関数・単体テスト可能):
@@ -84,6 +85,11 @@ canvasH = round(stageH * renderDpr)
 dx,dy,dw,dh = vis を renderDpr 倍したもの
 ```
 
+実装契約:
+
+- `scale`、ステージ・ソース・base寸法、`dpr` は有限の正数、`panX/Y` は有限値に限定する。不正入力または交差領域が空なら `null` を返し、呼び出し側はclearだけ行う。
+- canvasの整数サイズは値が変わった場合だけ更新し、クロップ・描画矩形は浮動小数のままCanvas 2Dへ渡す。
+- ResizeObserverやwindow resizeはview更新を一元化し、毎回最新の`devicePixelRatio`を渡す。canvas再確保はrAF単位への集約余地を残す。
 - `sw > dw` のとき(縮小表示)は自動的にダウンサンプル、`sw < dw` のとき(ネイティブ超えズーム)はピクセル拡大。後者で `imageSmoothingEnabled = false`(ニアレストネイバー)に切り替えるかは Phase 3 でオプション検討。
 - 1080p 素材はソース矩形がソース解像度で頭打ちになるだけで、特別扱い不要。
 
@@ -97,6 +103,13 @@ dx,dy,dw,dh = vis を renderDpr 倍したもの
   - リスク: サンプル保持がデコーダのフレームプール/バックプレッシャを詰まらせないか **Phase 1 で要実測**。問題があれば「ビューポートサイズの canvas に 1 枚コピーして保持」にフォールバック(コピーは現行 blit と同等コスト)。
 - `Player.setView(view: ViewState)` を新設。main.ts の `applyVideoView()` から毎回呼ぶ。停止中は即時再描画、再生中は保持のみ(次の blit から反映。パン中の滑らかさが足りなければ rAF で現サンプル再描画)。
 
+#### VideoSampleの所有権・デコーダ運用
+
+- 再生イテレータの未表示フレームは`nextFrame`、表示済みフレームは`currentSample`だけが所有する。表示の置換、seek、iterator停止、load、dispose、世代不一致、エラー時に必ず`close()`する。
+- ステップ先読みはサンプルをbase解像度canvasへコピーした直後に`close()`する。これにより数百枚キャッシュしてもWebCodecsのデコーダサーフェスを保持しない。
+- Mediabunnyは各`samples()`/`getSample()`呼び出しに独立したデコード処理を作れるが、同時デコーダ数は抑える。再生中は再生iteratorを優先し、停止中の精細化は世代IDで古い結果を破棄する。
+- 初期実装の精細保持は`currentSample` 1枚だけとする。VideoSampleの実メモリとGPU surface消費はブラウザ依存のため、LRUは実測で余裕を確認後、最大3枚かつ推定96MiB以下でのみ追加する。
+- `sample.draw()`のクロップ引数はMediabunny 1.49実装上、回転後の`displayWidth/displayHeight`座標から内部でソース座標へ変換される。90/180/270度素材は実機受け入れ試験にも残す。
 ### 3.3 一時停止・コマ送り: 「即応は低解像度、静止したら精細化」
 
 ステップキャッシュは**現行どおりビュー非依存・縮小解像度(base サイズ)のまま**維持する。ズーム状態でキャッシュを作り直すとパン毎に全キャッシュ無効化→数十枚再デコードとなり本末転倒のため。
@@ -105,10 +118,10 @@ dx,dy,dw,dh = vis を renderDpr 倍したもの
 
 1. コマ送り・シーク直後はステップキャッシュ(base 解像度)から即クロップ描画(ズーム中は一瞬ぼける)。
 2. 操作が約 150–180ms 静止したら、`videoSink.getSample(currentTime)` でフル解像度サンプルを 1 枚取得してシャープに再描画。
-3. 取得したサンプルは小さな LRU(`detailSamples`、予算例: min(256MB, 一時停止予算/4)≒ 4K で 7〜8 枚)に保持。往復コマ送りでの A/B 比較が再デコードなしで効く。
+3. 取得したサンプルは初期実装では `currentSample` 1枚だけ保持する。往復比較用LRUはデコーダ詰まりがないことを実測後にのみ追加する。
 4. 精細化の要否判定: `表示デバイスピクセル幅 > baseRenderWidth 相当` のときだけ実行(等倍以下では何もしない)。
 
-- 精細化は既存の `pausedDetailGen` 世代管理・180ms デバウンスの考え方を流用(タイマーは main.ts から Player 内へ移す)。
+- 精細化は既存の `pausedDetailGen` 世代管理・180ms デバウンスの考え方を流用(タイマーは既存どおり main.ts に置き、Player側の世代IDで競合を防ぐ)。
 - 未コミットの `renderPausedDetail()` / `restoreOptimizedCanvas()` はこの仕組みに**吸収・削除**(canvas 実解像度の付け替え自体が不要になる)。
 
 ### 3.4 ステップキャッシュとの接続
@@ -127,7 +140,7 @@ dx,dy,dw,dh = vis を renderDpr 倍したもの
 | ファイル | 変更 |
 |---|---|
 | `src/player/view.ts` | **新規**: ViewState / ViewMapping / computeViewMapping(純関数) |
-| `src/player/Player.ts` | videoSink 置換、blit 書き換え、setView 追加、currentSample 保持、精細化(detailSamples LRU)、storeSample、renderPausedDetail 削除 |
+| `src/player/Player.ts` | videoSink 置換、blit 書き換え、setView 追加、currentSample 1枚保持、世代管理付き精細化、storeSample、旧canvas差し替え処理削除 |
 | `src/main.ts` | canvas をステージフィット固定(transform 廃止)、applyVideoView → setView 呼び出し、fitScale の参照先変更、ResizeObserver でステージサイズ追従、pausedDetailTimer 削除 |
 | `index.html` / CSS | canvas の配置スタイル変更(ステージ 100% フィット) |
 | `package.json` | (推奨) vitest 追加 — view.ts の座標計算テスト用 |
@@ -149,9 +162,9 @@ dx,dy,dw,dh = vis を renderDpr 倍したもの
 - **検証**: 4K/60fps 素材で再生ズーム時の frame drop、`currentSample` 保持によるデコーダ詰まりの有無(詰まる場合はフォールバック案に切替)。
 
 ### Phase 2: 一時停止・コマ送りの精細化(中)
-- Player 内デバウンス精細化、`detailSamples` LRU、精細化要否判定。
+- Player 内デバウンス精細化、単一 `currentSample`、精細化要否判定。LRUは安定性確認後の任意追加。
 - storeSample 化(ステップキャッシュとの接続)。
-- **完了条件**: 停止中ズーム→150ms程度でフル解像度化。ズームしたままコマ送り→送り中は即応(ぼけ許容)、静止でシャープ。LRU ヒット時は即シャープ。メモリ予算内(memUsage 表示で確認)。
+- **完了条件**: 停止中ズーム→150ms程度でフル解像度化。ズームしたままコマ送り→送り中は即応(ぼけ許容)、静止でシャープ。同一時刻の `currentSample` があれば即シャープ。メモリ予算内(memUsage 表示で確認)。
 
 ### Phase 3: 仕上げ・チューニング(小)
 - ネイティブ超えズームの `imageSmoothingEnabled` オプション検討。

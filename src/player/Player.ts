@@ -5,12 +5,13 @@ import {
   CanvasSink,
   EncodedPacketSink,
   Input,
+  VideoSampleSink,
   type InputTrack,
-  type InputVideoTrack,
+  type VideoSample,
   type WrappedAudioBuffer,
-  type WrappedCanvas,
 } from 'mediabunny';
 import type { CacheRange } from './FrameCache';
+import { computeViewMapping, type ViewState } from './view';
 
 export interface LoadedInfo {
   name: string;
@@ -51,7 +52,7 @@ export interface StepFrame {
   canvas: HTMLCanvasElement;
 }
 
-type CanvasIterator = AsyncGenerator<WrappedCanvas, void, unknown>;
+type VideoIterator = AsyncGenerator<VideoSample, void, unknown>;
 
 const clamp = (v: number, lo: number, hi: number) => (v < lo ? lo : v > hi ? hi : v);
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -66,8 +67,8 @@ const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 export class Player {
   private ctx2d: CanvasRenderingContext2D;
   private input: Input | null = null;
-  private videoSink: CanvasSink | null = null;
-  private videoTrack: InputVideoTrack | null = null;
+  private videoSink: VideoSampleSink | null = null;
+  private detailSink: VideoSampleSink | null = null;
   private thumbnailSink: CanvasSink | null = null;
   private thumbnailPacketSink: EncodedPacketSink | null = null;
   private thumbnailUnavailable = false;
@@ -75,13 +76,14 @@ export class Player {
   private audioContext: AudioContext | null = null;
   private gainNode: GainNode | null = null;
   private audioCaptureDestination: MediaStreamAudioDestinationNode | null = null;
-  private videoCanBeTransparent = false;
 
   private raf = 0;
   private asyncId = 0;
-  private videoIterator: CanvasIterator | null = null;
+  private videoIterator: VideoIterator | null = null;
   private audioIterator: AsyncGenerator<WrappedAudioBuffer, void, unknown> | null = null;
-  private nextFrame: WrappedCanvas | null = null;
+  private nextFrame: VideoSample | null = null;
+  private currentSample: VideoSample | null = null;
+  private view: ViewState = { scale: 1, panX: 0, panY: 0, stageWidth: 1, stageHeight: 1, dpr: 1 };
   private queuedAudioNodes = new Set<AudioBufferSourceNode>();
 
   private firstTimestamp = 0;
@@ -180,6 +182,9 @@ export class Player {
     return this.input !== null;
   }
 
+  get baseDisplayWidth(): number { return this.baseRenderWidth; }
+  get baseDisplayHeight(): number { return this.baseRenderHeight; }
+
   get interactiveBusy(): boolean {
     return this.playStarting || this.playing || this.seekRunning || this.stepQueueRunning || this.stepDecoding || this.stepPrefetchRunning;
   }
@@ -244,7 +249,6 @@ export class Player {
 
     if (videoTrack) {
       const videoCanBeTransparent = await videoTrack.canBeTransparent();
-      this.videoCanBeTransparent = videoCanBeTransparent;
       const displayWidth = await videoTrack.getDisplayWidth();
       const displayHeight = await videoTrack.getDisplayHeight();
       this.sourceWidth = displayWidth;
@@ -264,17 +268,9 @@ export class Player {
       );
       const renderWidth = Math.max(1, Math.round(displayWidth * renderScale));
       const renderHeight = Math.max(1, Math.round(displayHeight * renderScale));
-      this.videoSink = new CanvasSink(videoTrack, {
-        poolSize: 2,
-        width: renderWidth,
-        height: renderHeight,
-        fit: 'contain',
-        alpha: videoCanBeTransparent,
-        decoderOptions: {
-          optimizeForLatency: true,
-        },
-      });
-      this.videoTrack = videoTrack;
+      this.videoSink = new VideoSampleSink(videoTrack, { optimizeForLatency: true });
+      this.detailSink = new VideoSampleSink(videoTrack, { optimizeForLatency: true });
+
       this.thumbnailSink = new CanvasSink(videoTrack, {
         poolSize: 1,
         width: 180,
@@ -297,10 +293,9 @@ export class Player {
       this.sourceWidth = 1;
       this.sourceHeight = 1;
       this.videoSink = null;
-      this.videoTrack = null;
+      this.detailSink = null;
       this.thumbnailSink = null;
       this.thumbnailPacketSink = null;
-      this.videoCanBeTransparent = false;
     }
     this.frameDuration = 1 / this.fps;
     this.playbackFps = this.sanitizePlaybackFps(restore?.playbackFps ?? null);
@@ -417,42 +412,33 @@ export class Player {
     }
   }
 
-  async renderPausedDetail(scale: number): Promise<void> {
-    if (this.playing || !this.videoTrack || !this.videoSink) return;
+  async renderPausedDetail(_scale?: number): Promise<void> {
+    if (this.playing || !this.detailSink) return;
     const gen = ++this.pausedDetailGen;
-    const detailScale = Math.max(1, scale);
-    const width = Math.min(this.sourceWidth, Math.max(this.baseRenderWidth, Math.round(this.baseRenderWidth * detailScale)));
-    const height = Math.min(this.sourceHeight, Math.max(this.baseRenderHeight, Math.round(this.baseRenderHeight * detailScale)));
-
-    if (width === this.baseRenderWidth && height === this.baseRenderHeight) {
-      this.restoreOptimizedCanvas();
-      const cached = this.nearestCachedFrame(this.currentTime);
-      if (cached) this.blitStepFrame(cached);
-      else await this.drawAt(this.currentTime);
+    const sample = await this.detailSink.getSample(this.toLookupMediaTime(this.currentTime));
+    if (!sample) return;
+    if (gen !== this.pausedDetailGen || this.playing) {
+      sample.close();
       return;
     }
-
-    const sink = new CanvasSink(this.videoTrack, {
-      poolSize: 1,
-      width,
-      height,
-      fit: 'contain',
-      alpha: this.videoCanBeTransparent,
-      decoderOptions: { optimizeForLatency: true },
-    });
-    const frame = await sink.getCanvas(this.toLookupMediaTime(this.currentTime));
-    if (gen !== this.pausedDetailGen || this.playing || !frame) return;
-    this.canvas.width = width;
-    this.canvas.height = height;
-    this.blit(frame);
+    this.blit(sample);
   }
 
   private restoreOptimizedCanvas(): void {
     this.pausedDetailGen++;
-    if (this.canvas.width === this.baseRenderWidth && this.canvas.height === this.baseRenderHeight) return;
-    this.canvas.width = this.baseRenderWidth;
-    this.canvas.height = this.baseRenderHeight;
   }
+
+  setView(view: ViewState): void {
+    this.view = view;
+    this.resizeOutputCanvas();
+    if (this.currentSample) this.drawSample(this.currentSample);
+    else {
+      const cached = this.nearestCachedFrame(this.currentTime);
+      if (cached) this.blitStepFrame(cached);
+      else this.ctx2d.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    }
+  }
+
   pause(): void {
     if (!this.playing) return;
     const visibleTime = this.lastDrawnMediaTime === null ? this.getPlaybackTime() : this.fromMediaTime(this.lastDrawnMediaTime);
@@ -514,7 +500,11 @@ export class Player {
       while (id === this.asyncId) {
         const next = await iterator.next();
         const frame = next.value ?? null;
-        if (!frame || id !== this.asyncId) break;
+        if (!frame) break;
+        if (id !== this.asyncId) {
+          frame.close();
+          break;
+        }
 
         if (frame.timestamp <= this.toLookupMediaTime(this.currentTime)) {
           this.blit(frame);
@@ -985,24 +975,29 @@ export class Player {
     if (to - from <= this.frameDuration * 0.5) return;
 
     if (trackRange) this.stepDecodingFrom = Math.min(this.stepDecodingFrom, from);
-    const it = this.videoSink.canvases(this.toMediaTime(from), this.toMediaTime(to));
+    const it = this.videoSink.samples(this.toMediaTime(from), this.toMediaTime(to));
     let mark = performance.now();
     let addedSinceEvict = 0;
     try {
       for (;;) {
         const next = await it.next();
-        if (next.done || gen !== this.stepGen) break;
+        if (next.done) break;
         const frame = next.value;
+        if (gen !== this.stepGen) {
+          frame.close();
+          break;
+        }
         const t = this.fromMediaTime(frame.timestamp);
         const key = this.frameKey(t);
         if (this.stepFrames.has(key)) {
           // 既読フレームはデコードのみ進み、コピー・退避は行わない。
           if (trackRange) this.stepDecodingTo = Math.max(this.stepDecodingTo, t + frame.duration);
         } else {
-          const cached = this.storeWrappedCanvas(frame);
+          const cached = this.storeSample(frame);
           if (trackRange) this.stepDecodingTo = Math.max(this.stepDecodingTo, cached.time + cached.duration);
           addedSinceEvict++;
         }
+        frame.close();
         if (performance.now() - mark > 6) {
           if (addedSinceEvict > 0) {
             this.evictStepFrames(this.currentTime);
@@ -1067,20 +1062,20 @@ export class Player {
     return count;
   }
 
-  private storeWrappedCanvas(frame: WrappedCanvas): StepFrame {
-    const time = this.fromMediaTime(frame.timestamp);
+  private storeSample(sample: VideoSample): StepFrame {
+    const time = this.fromMediaTime(sample.timestamp);
     const key = this.frameKey(time);
     const existing = this.stepFrames.get(key);
     if (existing) return existing;
 
     const canvas = document.createElement('canvas');
-    canvas.width = frame.canvas.width;
-    canvas.height = frame.canvas.height;
+    canvas.width = this.baseRenderWidth;
+    canvas.height = this.baseRenderHeight;
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('Frame cache canvas context is unavailable.');
-    ctx.drawImage(frame.canvas, 0, 0);
+    sample.drawWithFit(ctx, { fit: 'contain' });
 
-    const cached: StepFrame = { time, duration: frame.duration, canvas };
+    const cached: StepFrame = { time, duration: sample.duration, canvas };
     this.stepFrames.set(key, cached);
     this.insertStepKey(key);
     return cached;
@@ -1168,22 +1163,27 @@ export class Player {
   private async startVideoIterator(drawFirst = false): Promise<boolean> {
     this.asyncId++;
     const id = this.asyncId;
-    this.nextFrame = null;
     await this.stopVideoIterator();
     if (id !== this.asyncId || !this.videoSink) return false;
 
-    const iterator = this.videoSink.canvases(this.toMediaTime(this.currentTime), this.toMediaTime(this.playbackEnd));
+    const iterator = this.videoSink.samples(this.toMediaTime(this.currentTime), this.toMediaTime(this.playbackEnd));
     this.videoIterator = iterator;
-    let first: WrappedCanvas | null;
-    let second: WrappedCanvas | null;
+    let first: VideoSample | null = null;
+    let second: VideoSample | null = null;
     try {
       first = (await iterator.next()).value ?? null;
       second = (await iterator.next()).value ?? null;
     } catch (error) {
+      first?.close();
+      second?.close();
       if (id !== this.asyncId || this.videoIterator !== iterator) return false;
       throw error;
     }
-    if (id !== this.asyncId || this.videoIterator !== iterator) return false;
+    if (id !== this.asyncId || this.videoIterator !== iterator) {
+      first?.close();
+      second?.close();
+      return false;
+    }
     if (!first) {
       this.logVideoIssue('video iterator did not return an initial frame', {
         currentTime: this.currentTime,
@@ -1196,6 +1196,7 @@ export class Player {
       this.blit(first);
       this.nextFrame = second;
     } else if (first && first.timestamp <= mediaNow + 1e-6) {
+      first.close();
       this.nextFrame = second;
     } else {
       this.nextFrame = first;
@@ -1209,16 +1210,18 @@ export class Player {
 
   private async drawAt(time: number, workGen = this.workGen): Promise<StepFrame | null> {
     if (!this.videoSink) return null;
-    const frame = await this.videoSink.getCanvas(this.toLookupMediaTime(time));
-    if (workGen !== this.workGen) return null;
-    if (frame) {
-      const cached = this.storeWrappedCanvas(frame);
-      this.blitStepFrame(cached);
-      return cached;
-    } else {
+    const sample = await this.videoSink.getSample(this.toLookupMediaTime(time));
+    if (!sample) {
       this.logVideoIssue('video sink returned no frame for drawAt', { time });
       return null;
     }
+    if (workGen !== this.workGen) {
+      sample.close();
+      return null;
+    }
+    const cached = this.storeSample(sample);
+    this.blit(sample);
+    return cached;
   }
 
   async thumbnailAt(time: number, width: number, height: number): Promise<HTMLCanvasElement | null> {
@@ -1282,26 +1285,52 @@ export class Player {
     }
   }
 
-  private blit(frame: WrappedCanvas): void {
-    if (!this.canDrawSource(frame.canvas, 'playback')) return;
+  private resizeOutputCanvas(): void {
+    const mapping = computeViewMapping(this.view, this.sourceWidth, this.sourceHeight, this.baseRenderWidth, this.baseRenderHeight);
+    const width = mapping?.canvasWidth ?? Math.max(1, Math.round(this.view.stageWidth * Math.min(this.view.dpr, 1)));
+    const height = mapping?.canvasHeight ?? Math.max(1, Math.round(this.view.stageHeight * Math.min(this.view.dpr, 1)));
+    if (this.canvas.width !== width) this.canvas.width = width;
+    if (this.canvas.height !== height) this.canvas.height = height;
+  }
+
+  private drawSample(sample: VideoSample): void {
+    const mapping = computeViewMapping(this.view, this.sourceWidth, this.sourceHeight, this.baseRenderWidth, this.baseRenderHeight);
+    this.resizeOutputCanvas();
+    this.ctx2d.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    if (!mapping) return;
+    sample.draw(this.ctx2d, mapping.sx, mapping.sy, mapping.sw, mapping.sh, mapping.dx, mapping.dy, mapping.dw, mapping.dh);
+  }
+
+  private blit(sample: VideoSample): void {
     try {
-      if (this.videoCanBeTransparent) this.ctx2d.clearRect(0, 0, this.canvas.width, this.canvas.height);
-      this.ctx2d.drawImage(frame.canvas, 0, 0, this.canvas.width, this.canvas.height);
+      this.drawSample(sample);
     } catch (error) {
-      this.logVideoIssue('drawImage failed during playback blit', { error });
+      sample.close();
+      this.logVideoIssue('VideoSample draw failed during playback blit', { error });
       return;
     }
-    this.lastDrawnMediaTime = frame.timestamp;
+    if (this.currentSample && this.currentSample !== sample) this.currentSample.close();
+    this.currentSample = sample;
+    this.lastDrawnMediaTime = sample.timestamp;
   }
 
   private blitStepFrame(frame: StepFrame): void {
-    if (!this.canDrawSource(frame.canvas, 'step')) return;
+    const mapping = computeViewMapping(this.view, this.sourceWidth, this.sourceHeight, this.baseRenderWidth, this.baseRenderHeight);
+    this.resizeOutputCanvas();
+    this.ctx2d.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    if (!mapping || !this.canDrawSource(frame.canvas, 'step')) return;
     try {
-      if (this.videoCanBeTransparent) this.ctx2d.clearRect(0, 0, this.canvas.width, this.canvas.height);
-      this.ctx2d.drawImage(frame.canvas, 0, 0, this.canvas.width, this.canvas.height);
+      const sxScale = frame.canvas.width / this.sourceWidth;
+      const syScale = frame.canvas.height / this.sourceHeight;
+      this.ctx2d.drawImage(frame.canvas, mapping.sx * sxScale, mapping.sy * syScale,
+        mapping.sw * sxScale, mapping.sh * syScale, mapping.dx, mapping.dy, mapping.dw, mapping.dh);
     } catch (error) {
       this.logVideoIssue('drawImage failed during step blit', { error, time: frame.time });
       return;
+    }
+    if (this.currentSample) {
+      this.currentSample.close();
+      this.currentSample = null;
     }
     this.lastDrawnMediaTime = this.toMediaTime(frame.time);
   }
@@ -1367,7 +1396,9 @@ export class Player {
   private async stopVideoIterator(): Promise<void> {
     const iterator = this.videoIterator;
     this.videoIterator = null;
+    const pending = this.nextFrame;
     this.nextFrame = null;
+    pending?.close();
     try {
       await iterator?.return(undefined);
     } catch {
@@ -1655,8 +1686,10 @@ export class Player {
     }
     this.audioSink = null;
     this.audioCaptureDestination = null;
+    this.currentSample?.close();
+    this.currentSample = null;
     this.videoSink = null;
-    this.videoTrack = null;
+    this.detailSink = null;
     this.thumbnailSink = null;
     this.thumbnailPacketSink = null;
     this.clearStepFrames();

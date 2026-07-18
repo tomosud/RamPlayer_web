@@ -919,12 +919,12 @@ function blurControl(el: HTMLElement): void {
 }
 
 function fitScale(): number {
-  if (!canvas.width || !canvas.height) return 1;
+  if (!player.baseDisplayWidth || !player.baseDisplayHeight) return 1;
   const rect = stage.getBoundingClientRect();
   const inset = 32;
   const availableW = Math.max(1, rect.width - inset);
   const availableH = Math.max(1, rect.height - inset);
-  return Math.min(availableW / canvas.width, availableH / canvas.height);
+  return Math.min(availableW / player.baseDisplayWidth, availableH / player.baseDisplayHeight);
 }
 
 function syncScaleSelect(): void {
@@ -940,9 +940,14 @@ function syncScaleSelect(): void {
 
 function applyVideoView(): void {
   const rect = stage.getBoundingClientRect();
-  const x = rect.width / 2 + videoPanX;
-  const y = rect.height / 2 + videoPanY;
-  canvas.style.transform = `translate(${x}px, ${y}px) translate(-50%, -50%) scale(${videoScale})`;
+  player.setView({
+    scale: videoScale,
+    panX: videoPanX,
+    panY: videoPanY,
+    stageWidth: Math.max(1, rect.width),
+    stageHeight: Math.max(1, rect.height),
+    dpr: Math.max(1, window.devicePixelRatio || 1),
+  });
   syncScaleSelect();
   window.clearTimeout(pausedDetailTimer);
   if (player.loaded && !player.playing) {
@@ -1682,10 +1687,16 @@ window.addEventListener('pointercancel', () => {
   stage.classList.remove('is-panning');
 });
 
-window.addEventListener('resize', () => {
-  if (viewScaleMode === 'fit') fitVideoToStage();
-  else applyVideoView();
-});
+let viewResizeRaf = 0;
+const scheduleViewResize = () => {
+  cancelAnimationFrame(viewResizeRaf);
+  viewResizeRaf = requestAnimationFrame(() => {
+    if (viewScaleMode === 'fit') fitVideoToStage();
+    else applyVideoView();
+  });
+};
+new ResizeObserver(scheduleViewResize).observe(stage);
+window.addEventListener('resize', scheduleViewResize);
 
 async function onDrop(e: DragEvent): Promise<void> {
   e.preventDefault();
