@@ -116,6 +116,7 @@ let viewScaleMode: 'fit' | 'custom' = 'fit';
 let videoScale = 1;
 let videoPanX = 0;
 let videoPanY = 0;
+let pausedDetailTimer = 0;
 let stageDrag: { pointerId: number; x: number; y: number } | null = null;
 let thumbGen = 0;
 let timelineThumbnails: TimelineThumbnail[] = [];
@@ -943,6 +944,12 @@ function applyVideoView(): void {
   const y = rect.height / 2 + videoPanY;
   canvas.style.transform = `translate(${x}px, ${y}px) translate(-50%, -50%) scale(${videoScale})`;
   syncScaleSelect();
+  window.clearTimeout(pausedDetailTimer);
+  if (player.loaded && !player.playing) {
+    pausedDetailTimer = window.setTimeout(() => {
+      void player.renderPausedDetail(videoScale);
+    }, 180);
+  }
 }
 
 function setVideoScale(nextScale: number, anchorClientX?: number, anchorClientY?: number): void {
@@ -1481,6 +1488,10 @@ const player = new Player(canvas, {
       hideTimelinePreview();
     } else {
       resumeTimelineThumbnailWork();
+      window.clearTimeout(pausedDetailTimer);
+      pausedDetailTimer = window.setTimeout(() => {
+        void player.renderPausedDetail(videoScale);
+      }, 180);
     }
     syncMoonshinePlayback();
   },

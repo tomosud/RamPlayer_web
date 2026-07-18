@@ -6,6 +6,7 @@ import {
   EncodedPacketSink,
   Input,
   type InputTrack,
+  type InputVideoTrack,
   type WrappedAudioBuffer,
   type WrappedCanvas,
 } from 'mediabunny';
@@ -66,6 +67,7 @@ export class Player {
   private ctx2d: CanvasRenderingContext2D;
   private input: Input | null = null;
   private videoSink: CanvasSink | null = null;
+  private videoTrack: InputVideoTrack | null = null;
   private thumbnailSink: CanvasSink | null = null;
   private thumbnailPacketSink: EncodedPacketSink | null = null;
   private thumbnailUnavailable = false;
@@ -89,6 +91,9 @@ export class Player {
   private lastDrawnMediaTime: number | null = null;
   private sourceWidth = 1;
   private sourceHeight = 1;
+  private baseRenderWidth = 1;
+  private baseRenderHeight = 1;
+  private pausedDetailGen = 0;
 
   currentTime = 0;
   duration = 0;
@@ -134,8 +139,8 @@ export class Player {
   private bytesPerFrame = 1280 * 720 * 4;
   /** 再生中のフレームキャッシュ予算（控えめ。再生デコードと併存するため）。 */
   private readonly playingBudgetBytes = 256 * 1024 * 1024;
-  /** 一時停止中のフレームキャッシュ予算（deviceMemory から算出、上限2GB）。load() で確定。 */
-  private pausedBudgetBytes = 2 * 1024 * 1024 * 1024;
+  /** 一時停止中のフレームキャッシュ予算（deviceMemory から算出、上限1GB）。load() で確定。 */
+  private pausedBudgetBytes = 1 * 1024 * 1024 * 1024;
   private lastVideoIssueLogAt = 0;
 
   /** 現在の状態に応じたフレームキャッシュ予算（バイト）。一時停止中は大きく取る。 */
@@ -269,6 +274,7 @@ export class Player {
           optimizeForLatency: true,
         },
       });
+      this.videoTrack = videoTrack;
       this.thumbnailSink = new CanvasSink(videoTrack, {
         poolSize: 1,
         width: 180,
@@ -279,6 +285,10 @@ export class Player {
       this.thumbnailPacketSink = new EncodedPacketSink(videoTrack);
       this.canvas.width = renderWidth;
       this.canvas.height = renderHeight;
+      this.baseRenderWidth = renderWidth;
+      this.baseRenderHeight = renderHeight;
+      this.canvas.style.width = `${renderWidth}px`;
+      this.canvas.style.height = `${renderHeight}px`;
       this.fps = fps;
     } else {
       guardLoad();
@@ -287,6 +297,7 @@ export class Player {
       this.sourceWidth = 1;
       this.sourceHeight = 1;
       this.videoSink = null;
+      this.videoTrack = null;
       this.thumbnailSink = null;
       this.thumbnailPacketSink = null;
       this.videoCanBeTransparent = false;
@@ -295,10 +306,10 @@ export class Player {
     this.playbackFps = this.sanitizePlaybackFps(restore?.playbackFps ?? null);
 
     // フレームキャッシュ予算をこの動画の解像度・実機RAMから確定する。
-    // 1枚 = 表示幅×高さ×RGBA(4byte)。deviceMemory(GB) の 40% を上限2GBで一時停止予算とする。
+    // 1枚 = 表示幅×高さ×RGBA(4byte)。deviceMemory(GB) の 40% を上限1GBで一時停止予算とする。
     this.bytesPerFrame = Math.max(1, this.canvas.width * this.canvas.height * 4);
     const deviceMemoryGB = (navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 4;
-    this.pausedBudgetBytes = Math.min(deviceMemoryGB * 1024 * 0.4, 2048) * 1024 * 1024;
+    this.pausedBudgetBytes = Math.min(deviceMemoryGB * 1024 * 0.4, 1024) * 1024 * 1024;
 
     const audioSampleRate = audioTrack ? await audioTrack.getSampleRate() : undefined;
     guardLoad();
@@ -368,6 +379,7 @@ export class Player {
     this.playStarting = true;
     this.callbacks.onPreparing(true);
     try {
+      this.restoreOptimizedCanvas();
       this.requestedStepPrefetchCenter = null;
       this.interruptThumbnailWork();
       this.stepGen++;
@@ -405,6 +417,42 @@ export class Player {
     }
   }
 
+  async renderPausedDetail(scale: number): Promise<void> {
+    if (this.playing || !this.videoTrack || !this.videoSink) return;
+    const gen = ++this.pausedDetailGen;
+    const detailScale = Math.max(1, scale);
+    const width = Math.min(this.sourceWidth, Math.max(this.baseRenderWidth, Math.round(this.baseRenderWidth * detailScale)));
+    const height = Math.min(this.sourceHeight, Math.max(this.baseRenderHeight, Math.round(this.baseRenderHeight * detailScale)));
+
+    if (width === this.baseRenderWidth && height === this.baseRenderHeight) {
+      this.restoreOptimizedCanvas();
+      const cached = this.nearestCachedFrame(this.currentTime);
+      if (cached) this.blitStepFrame(cached);
+      else await this.drawAt(this.currentTime);
+      return;
+    }
+
+    const sink = new CanvasSink(this.videoTrack, {
+      poolSize: 1,
+      width,
+      height,
+      fit: 'contain',
+      alpha: this.videoCanBeTransparent,
+      decoderOptions: { optimizeForLatency: true },
+    });
+    const frame = await sink.getCanvas(this.toLookupMediaTime(this.currentTime));
+    if (gen !== this.pausedDetailGen || this.playing || !frame) return;
+    this.canvas.width = width;
+    this.canvas.height = height;
+    this.blit(frame);
+  }
+
+  private restoreOptimizedCanvas(): void {
+    this.pausedDetailGen++;
+    if (this.canvas.width === this.baseRenderWidth && this.canvas.height === this.baseRenderHeight) return;
+    this.canvas.width = this.baseRenderWidth;
+    this.canvas.height = this.baseRenderHeight;
+  }
   pause(): void {
     if (!this.playing) return;
     const visibleTime = this.lastDrawnMediaTime === null ? this.getPlaybackTime() : this.fromMediaTime(this.lastDrawnMediaTime);
@@ -1608,6 +1656,7 @@ export class Player {
     this.audioSink = null;
     this.audioCaptureDestination = null;
     this.videoSink = null;
+    this.videoTrack = null;
     this.thumbnailSink = null;
     this.thumbnailPacketSink = null;
     this.clearStepFrames();
