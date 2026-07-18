@@ -1316,21 +1316,19 @@ function positionSubtitleHistory(): void {
   const rect = canvas.getBoundingClientRect();
   if (rect.width <= 0 || rect.height <= 0) return;
   const gap = 10;
-  const availableRight = window.innerWidth - rect.right - gap * 2;
-  const width = Math.max(190, Math.min(360, availableRight));
-  if (availableRight >= 190) {
-    subtitleTranslationSource.style.left = `${rect.right + gap}px`;
-    subtitleTranslationSource.style.right = 'auto';
-    subtitleTranslationSource.style.top = `${Math.max(38, rect.top)}px`;
-    subtitleTranslationSource.style.width = `${width}px`;
-    subtitleTranslationSource.style.maxHeight = `${Math.max(120, Math.min(rect.height, window.innerHeight - Math.max(38, rect.top) - 16))}px`;
-  } else {
-    subtitleTranslationSource.style.left = 'auto';
-    subtitleTranslationSource.style.right = '8px';
-    subtitleTranslationSource.style.top = '42px';
-    subtitleTranslationSource.style.width = `${Math.min(320, window.innerWidth - 16)}px`;
-    subtitleTranslationSource.style.maxHeight = '45vh';
-  }
+  const panelLeft = rect.right + gap;
+  const panelTop = rect.top;
+  const panelWidth = 300;
+  subtitleTranslationSource.style.left = `${panelLeft}px`;
+  subtitleTranslationSource.style.right = 'auto';
+  subtitleTranslationSource.style.top = `${panelTop}px`;
+  subtitleTranslationSource.style.width = `${panelWidth}px`;
+  subtitleTranslationSource.style.maxHeight = `${Math.max(120, rect.height)}px`;
+
+  const panelRight = panelLeft + panelWidth;
+  const panelBottom = panelTop + Math.max(120, rect.height);
+  const overlapsVideo = panelLeft < rect.right && panelRight > rect.left && panelTop < rect.bottom && panelBottom > rect.top;
+  subtitleTranslationSource.classList.toggle('over-video', overlapsVideo);
 }
 
 function positionSubtitleOverlay(): void {

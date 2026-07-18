@@ -192,6 +192,11 @@ body {
   user-select: text;
   scrollbar-width: thin;
   scrollbar-color: rgba(82, 93, 110, 0.72) transparent;
+  transition: opacity 120ms ease;
+}
+
+.subtitle-translation-source.over-video {
+  opacity: 0.025;
 }
 
 .subtitle-translation-source::-webkit-scrollbar {
