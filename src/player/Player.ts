@@ -85,6 +85,7 @@ export class Player {
   private firstTimestamp = 0;
   private playbackMediaAtStart = 0;
   private audioContextStartTime = 0;
+  private audioCaptureLeadSec = 0;
   private lastDrawnMediaTime: number | null = null;
   private sourceWidth = 1;
   private sourceHeight = 1;
@@ -308,7 +309,6 @@ export class Player {
     this.gainNode = this.audioContext.createGain();
     this.gainNode.connect(this.audioContext.destination);
     this.audioCaptureDestination = this.audioContext.createMediaStreamDestination();
-    this.gainNode.connect(this.audioCaptureDestination);
     this.setVolume(this.volume);
 
     this.audioSink = audioTrack ? new AudioBufferSink(audioTrack) : null;
@@ -382,7 +382,7 @@ export class Player {
       if (this.audioContext.state === 'suspended') await this.audioContext.resume();
       if (!(await this.startVideoIterator())) return;
 
-      this.audioContextStartTime = this.audioContext.currentTime;
+      this.audioContextStartTime = this.audioContext.currentTime + this.audioCaptureLeadSec;
       this.playing = true;
       this.callbacks.onState(true);
       // 通常再生ではコマ送りキャッシュを使用しない。特に4Kでは数十枚でも
@@ -501,7 +501,33 @@ export class Player {
         this.queuedAudioNodes.add(node);
         node.onended = () => this.queuedAudioNodes.delete(node);
 
-        while (id === this.asyncId && timestamp - this.toMediaTime(this.currentTime) >= 1) {
+        if (this.audioCaptureDestination) {
+          const captureNode = this.audioContext.createBufferSource();
+          captureNode.buffer = buffer;
+          captureNode.playbackRate.value = this.playbackRate;
+          captureNode.connect(this.audioCaptureDestination);
+          const captureStartTime = startTime - this.audioCaptureLeadSec;
+          let captureStarted = false;
+          if (captureStartTime >= this.audioContext.currentTime) {
+            captureNode.start(captureStartTime);
+            captureStarted = true;
+          } else {
+            const offset = (this.audioContext.currentTime - captureStartTime) * this.playbackRate;
+            if (offset < buffer.duration) {
+              captureNode.start(this.audioContext.currentTime, offset);
+              captureStarted = true;
+            }
+          }
+          if (captureStarted) {
+            this.queuedAudioNodes.add(captureNode);
+            captureNode.onended = () => this.queuedAudioNodes.delete(captureNode);
+          }
+        }
+
+        while (
+          id === this.asyncId &&
+          timestamp - this.toMediaTime(this.currentTime) >= Math.max(1, this.audioCaptureLeadSec + 0.5)
+        ) {
           await delay(80);
         }
       }
@@ -1263,6 +1289,7 @@ export class Player {
 
   private getPlaybackTime(): number {
     if (!this.playing || !this.audioContext) return this.currentTime;
+    if (this.audioContext.currentTime < this.audioContextStartTime) return this.currentTime;
     return this.fromMediaTime(
       (this.audioContext.currentTime - this.audioContextStartTime) * this.playbackRate + this.playbackMediaAtStart,
     );
@@ -1302,6 +1329,32 @@ export class Player {
 
   private toMediaTime(time: number): number {
     return this.firstTimestamp + clamp(time, 0, this.duration);
+  }
+
+  setAudioCaptureLead(seconds: number): void {
+    const next = clamp(seconds, 0, 15);
+    if (Math.abs(next - this.audioCaptureLeadSec) < 1e-3) return;
+    const wasPlaying = this.playing;
+    const visibleTime = wasPlaying ? this.getPlaybackTime() : this.currentTime;
+    if (wasPlaying) this.stopPlaybackSideEffects();
+    this.audioCaptureLeadSec = next;
+    this.currentTime = this.clampToPlaybackRange(visibleTime);
+    this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
+    this.callbacks.onTime(this.currentTime);
+    if (wasPlaying) void this.play();
+  }
+
+  get audioCaptureLeadRemaining(): number {
+    if (!this.playing || !this.audioContext || this.audioCaptureLeadSec <= 0) return 0;
+    return Math.max(0, this.audioContextStartTime - this.audioContext.currentTime);
+  }
+
+  get audioCaptureTime(): number {
+    if (!this.playing || !this.audioContext) return this.currentTime;
+    const captureStart = this.audioContextStartTime - this.audioCaptureLeadSec;
+    return this.fromMediaTime(
+      (this.audioContext.currentTime - captureStart) * this.playbackRate + this.playbackMediaAtStart,
+    );
   }
 
   private toLookupMediaTime(time: number): number {
@@ -1517,6 +1570,8 @@ export class Player {
       audioContextTime: this.audioContext?.currentTime ?? 0,
       audioSampleRate: this.audioContext?.sampleRate,
       audioCaptureTracks: this.audioCaptureDestination?.stream.getAudioTracks().length ?? 0,
+      audioCaptureLeadSec: this.audioCaptureLeadSec,
+      audioCaptureLeadRemaining: this.audioCaptureLeadRemaining,
       hasAudioSink: this.audioSink !== null,
       hasAudioIterator: this.audioIterator !== null,
       queuedAudioNodes: this.queuedAudioNodes.size,

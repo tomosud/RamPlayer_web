@@ -165,6 +165,7 @@ interface MoonshineTranscriber {
 let moonshineTranscriber: MoonshineTranscriber | null = null;
 
 const moonshineUrl = 'https://cdn.jsdelivr.net/npm/@moonshine-ai/moonshine-js@0.1.29/dist/moonshine.min.js';
+const moonshineLeadSec = 5;
 
 const timelineThumbWidth = 96;
 const timelineThumbHeight = 54;
@@ -283,6 +284,7 @@ function buildDiagnosticsText(): string {
     `Audio context: ${d.audioContextState} @ ${d.audioContextTime.toFixed(3)} sec`,
     `Audio sink / iterator: ${d.hasAudioSink} / ${d.hasAudioIterator}`,
     `Audio capture tracks: ${d.audioCaptureTracks}`,
+    `Subtitle audio lead: ${d.audioCaptureLeadSec.toFixed(1)} sec (preroll ${d.audioCaptureLeadRemaining.toFixed(1)} sec)`,
     `Queued audio nodes: ${d.queuedAudioNodes}`,
     `Decoded cache: ${d.cacheFrames} frames, ${fmtBytes(d.cacheBytes)} / ${fmtBytes(d.cacheBudgetBytes)}`,
     `Decode range: ${d.decodingFrom.toFixed(3)} - ${d.decodingTo.toFixed(3)} sec`,
@@ -1203,6 +1205,7 @@ function setAdvancedOpen(open: boolean): void {
 }
 
 function resetMoonshineForFile(_file: File, hasAudio: boolean): void {
+  player.setAudioCaptureLead(0);
   moonshineTranscriber?.stop();
   moonshineTranscriber = null;
   moonshineLoaded = false;
@@ -1210,6 +1213,7 @@ function resetMoonshineForFile(_file: File, hasAudio: boolean): void {
   lastMoonshineText = '';
   lastMoonshineCueAt = -1;
   subtitleOverlay.textContent = '';
+  subtitleOverlay.classList.remove('is-preparing');
   subtitleOverlay.hidden = true;
   subtitleTranslationSource.replaceChildren();
   subtitleTranslationSource.hidden = true;
@@ -1270,10 +1274,15 @@ function updateSubtitleOverlayForTime(): void {
     return;
   }
   if (subtitlePreparing) {
-    subtitleOverlay.textContent = 'Preparing subtitles...';
+    const remaining = player.audioCaptureLeadRemaining;
+    subtitleOverlay.textContent = remaining > 0
+      ? `Preparing subtitles... ${remaining.toFixed(1)}s`
+      : 'Preparing subtitles...';
+    subtitleOverlay.classList.add('is-preparing');
     subtitleOverlay.hidden = false;
     return;
   }
+  subtitleOverlay.classList.remove('is-preparing');
   const now = player.visibleFrameTime;
   let active: SubtitleCue | null = null;
   for (let i = subtitleCues.length - 1; i >= 0; i--) {
@@ -1345,7 +1354,8 @@ async function startMoonshine(): Promise<void> {
   moonshineStarting = true;
   moonshineEnabled = true;
   subtitlePreparing = true;
-  subtitleOverlay.textContent = 'Preparing subtitles...';
+  subtitleOverlay.textContent = `Preparing subtitles... ${moonshineLeadSec.toFixed(1)}s`;
+  subtitleOverlay.classList.add('is-preparing');
   subtitleOverlay.hidden = false;
   positionSubtitleOverlay();
   moonshineToggleBtn.disabled = true;
@@ -1380,19 +1390,21 @@ async function startMoonshine(): Promise<void> {
           // VAD mode only emits committed captions at stable speech boundaries.
         },
         onTranscriptionCommitted(text, buffer) {
-          commitMoonshineCaption(text, player.currentTime - (buffer?.duration ?? 0));
+          commitMoonshineCaption(text, player.audioCaptureTime - (buffer?.duration ?? 0));
         },
       }, true);
       moonshineTranscriber.attachStream(stream);
     }
     await moonshineTranscriber.start();
     if (!player.playing) moonshineTranscriber.stop();
+    player.setAudioCaptureLead(moonshineLeadSec);
     moonshineToggleBtn.textContent = 'Stop';
     moonshineStatus.textContent = player.playing
       ? 'Listening and generating English captions.'
       : 'Ready. Play the media to begin transcription.';
   } catch (error) {
     moonshineEnabled = false;
+    player.setAudioCaptureLead(0);
     subtitlePreparing = false;
     subtitleOverlay.hidden = true;
     moonshineStatus.textContent = `Moonshine failed: ${error instanceof Error ? error.message : String(error)}`;
@@ -1406,9 +1418,11 @@ function stopMoonshine(): void {
   moonshineEnabled = false;
   subtitlePreparing = false;
   moonshineTranscriber?.stop();
+  player.setAudioCaptureLead(0);
   moonshineToggleBtn.textContent = 'Start';
   moonshineStatus.textContent = 'Stopped. Existing transcript remains available for translation.';
   subtitleOverlay.hidden = true;
+  subtitleOverlay.classList.remove('is-preparing');
   subtitleTranslationSource.hidden = true;
 }
 

@@ -163,6 +163,18 @@ body {
   pointer-events: none;
 }
 
+.subtitle-overlay.is-preparing {
+  padding: 3px 7px;
+  color: #e89535;
+  background: rgba(20, 13, 5, 0.72);
+  border: 1px solid rgba(232, 149, 53, 0.32);
+  box-shadow: none;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.2;
+  text-shadow: none;
+}
+
 .subtitle-translation-source {
   position: fixed;
   z-index: 22;
