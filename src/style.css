@@ -145,6 +145,60 @@ body {
 .drop-hint p { margin: 0; }
 .drop-hint .sub { font-size: 12px; opacity: 0.82; }
 
+.subtitle-overlay {
+  position: fixed;
+  z-index: 24;
+  left: 50%;
+  top: 50%;
+  max-width: min(900px, calc(100vw - 64px));
+  transform: translate(-50%, -100%);
+  padding: 7px 12px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.76);
+  border-radius: 5px;
+  font-size: clamp(16px, 2vw, 25px);
+  line-height: 1.35;
+  text-align: center;
+  text-shadow: 0 1px 2px #000;
+  pointer-events: none;
+}
+
+.subtitle-translation-source {
+  position: fixed;
+  z-index: 1;
+  left: 1px;
+  bottom: 1px;
+  width: 16px;
+  height: 8px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  padding: 0;
+  color: #fff;
+  background: transparent;
+  border: 0;
+  font-size: 1px;
+  line-height: 1;
+  opacity: 0.01;
+  pointer-events: none;
+}
+
+.subtitle-translation-source .subtitle-cue { margin: 0; }
+.subtitle-translation-source time { display: none; }
+
+.moonshine-host {
+  position: fixed;
+  left: -10000px;
+  top: 0;
+  width: 320px;
+  height: 180px;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.moonshine-host audio { width: 1px; height: 1px; }
+
 .resume-btn,
 .show-ui-btn {
   position: fixed;
@@ -218,6 +272,52 @@ body {
 .collapse-ui-btn:hover:not(:disabled) {
   color: var(--text);
 }
+
+.advanced-btn {
+  position: absolute;
+  z-index: 2;
+  right: 8px;
+  top: 7px;
+  width: 24px;
+  min-height: 24px;
+  padding: 0;
+  border-radius: 50%;
+  color: var(--muted);
+  background: rgba(36, 41, 54, 0.72);
+}
+
+.advanced-popover {
+  position: absolute;
+  z-index: 80;
+  right: 7px;
+  bottom: 40px;
+  width: min(430px, calc(100vw - 48px));
+  max-height: min(540px, calc(100vh - 80px));
+  overflow: auto;
+  padding: 10px;
+  background: rgba(17, 20, 27, 0.98);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.58);
+}
+
+.advanced-head,
+.advanced-option-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.advanced-head { margin-bottom: 9px; }
+.advanced-head strong { flex: 1; }
+.advanced-section { display: grid; gap: 9px; }
+.advanced-option-head > div { display: grid; gap: 3px; flex: 1; }
+.advanced-option-head small,
+.advanced-status { color: var(--muted); font-size: 12px; }
+.advanced-status { min-height: 17px; }
+
+.subtitle-cue { display: block; margin-bottom: 5px; }
+.subtitle-cue time { color: var(--muted); margin-right: 7px; font-variant-numeric: tabular-nums; }
 
 .show-ui-btn {
   padding: 7px 10px;

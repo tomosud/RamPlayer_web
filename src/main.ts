@@ -28,6 +28,10 @@ const topbar = (() => {
 })();
 const canvas = $<HTMLCanvasElement>('canvas');
 const dropHint = $<HTMLDivElement>('dropHint');
+const filePicker = $<HTMLInputElement>('filePicker');
+const subtitleOverlay = $<HTMLDivElement>('subtitleOverlay');
+const subtitleTranslationSource = $<HTMLDivElement>('subtitleTranslationSource');
+const moonshineVideo = $<HTMLAudioElement>('moonshineVideo');
 const resumeBtn = $<HTMLButtonElement>('resumeBtn');
 const errorBox = $<HTMLDivElement>('error');
 const filenameEl = $<HTMLDivElement>('filename');
@@ -55,6 +59,11 @@ const playbackFpsInput = $<HTMLInputElement>('playbackFps');
 const volumePopover = $<HTMLDivElement>('volumePopover');
 const volumeToggle = $<HTMLButtonElement>('volumeToggle');
 const volumePanel = $<HTMLDivElement>('volumePanel');
+const advancedBtn = $<HTMLButtonElement>('advancedBtn');
+const advancedPopover = $<HTMLDivElement>('advancedPopover');
+const advancedCloseBtn = $<HTMLButtonElement>('advancedCloseBtn');
+const moonshineToggleBtn = $<HTMLButtonElement>('moonshineToggleBtn');
+const moonshineStatus = $<HTMLDivElement>('moonshineStatus');
 
 const playPauseBtn = $<HTMLButtonElement>('playPause');
 const prevFrameBtn = $<HTMLButtonElement>('prevFrame');
@@ -126,6 +135,23 @@ let exportRunning = false;
 let exportAbortController: AbortController | null = null;
 let exportCopyCheckGen = 0;
 let showUiIdleTimer = 0;
+let moonshineObjectUrl: string | null = null;
+let moonshineLoaded = false;
+let moonshineEnabled = false;
+let moonshineStarting = false;
+let moonshinePlayPending = false;
+let lastMoonshineText = '';
+let lastMoonshineCueAt = -1;
+interface SubtitleCue {
+  time: number;
+  original: string;
+  element: HTMLSpanElement;
+}
+
+let subtitleCues: SubtitleCue[] = [];
+
+const moonshineUrl = 'https://cdn.jsdelivr.net/npm/@moonshine-ai/moonshine-js@0.1.29/dist/moonshine.min.js';
+const moonshineLeadSeconds = 3;
 
 const timelineThumbWidth = 96;
 const timelineThumbHeight = 54;
@@ -1098,6 +1124,227 @@ function renderFilmstrip(frames: StepFrame[], currentTime: number): void {
   }
 }
 
+function setAdvancedOpen(open: boolean): void {
+  advancedPopover.hidden = !open;
+  advancedBtn.setAttribute('aria-expanded', String(open));
+}
+
+function resetMoonshineForFile(file: File, hasAudio: boolean): void {
+  moonshineVideo.pause();
+  if (moonshineObjectUrl) URL.revokeObjectURL(moonshineObjectUrl);
+  moonshineObjectUrl = URL.createObjectURL(file);
+  moonshineVideo.src = moonshineObjectUrl;
+  moonshineVideo.muted = false;
+  moonshineVideo.load();
+  moonshineEnabled = false;
+  lastMoonshineText = '';
+  lastMoonshineCueAt = -1;
+  subtitleOverlay.textContent = '';
+  subtitleOverlay.hidden = true;
+  subtitleTranslationSource.replaceChildren();
+  subtitleTranslationSource.hidden = true;
+  subtitleCues = [];
+  moonshineToggleBtn.disabled = !hasAudio;
+  moonshineToggleBtn.textContent = 'Start';
+  moonshineStatus.textContent = hasAudio
+    ? (moonshineLoaded ? 'Ready.' : 'Ready. The model is downloaded when started.')
+    : 'This file has no decodable audio track.';
+}
+
+function normalizeCaptionText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function commitMoonshineCaption(value: string): void {
+  const text = normalizeCaptionText(value);
+  if (!moonshineEnabled || text.length < 2 || text.length > 600 || text === lastMoonshineText) return;
+  if (/^(loading|download|model|moonshine|\d{1,3}%)\b/i.test(text)) return;
+
+  lastMoonshineText = text;
+  const cueAt = Math.max(0, moonshineVideo.currentTime || player.currentTime + moonshineLeadSeconds);
+  if (Math.abs(cueAt - lastMoonshineCueAt) < 0.2) {
+    const translationLast = subtitleTranslationSource.lastElementChild?.querySelector('.subtitle-cue-text');
+    if (translationLast) translationLast.textContent = text;
+    return;
+  }
+  lastMoonshineCueAt = cueAt;
+  const row = document.createElement('span');
+  row.className = 'subtitle-cue';
+  row.dataset.start = String(cueAt);
+  const time = document.createElement('time');
+  time.dateTime = String(cueAt);
+  time.textContent = fmt(cueAt);
+  const words = document.createElement('span');
+  words.className = 'subtitle-cue-text';
+  words.textContent = text;
+  row.append(time, words);
+  const translationRow = row.cloneNode(true) as HTMLSpanElement;
+  const translationWords = translationRow.querySelector<HTMLSpanElement>('.subtitle-cue-text');
+  if (!translationWords) return;
+  subtitleTranslationSource.appendChild(translationRow);
+  while (subtitleTranslationSource.childElementCount > 20) {
+    subtitleTranslationSource.firstElementChild?.remove();
+  }
+  subtitleTranslationSource.hidden = false;
+  subtitleCues.push({ time: cueAt, original: text, element: translationWords });
+}
+
+function updateSubtitleOverlayForTime(): void {
+  if (!moonshineEnabled) {
+    subtitleOverlay.hidden = true;
+    return;
+  }
+  const now = player.visibleFrameTime;
+  let active: SubtitleCue | null = null;
+  for (let i = subtitleCues.length - 1; i >= 0; i--) {
+    if (subtitleCues[i].time <= now + 0.2) {
+      active = subtitleCues[i];
+      break;
+    }
+  }
+  if (!active || now - active.time > 7) {
+    subtitleOverlay.hidden = true;
+    return;
+  }
+  const translated = normalizeCaptionText(active.element.textContent ?? '');
+  subtitleOverlay.textContent = translated || active.original;
+  subtitleOverlay.hidden = false;
+}
+
+function positionSubtitleOverlay(): void {
+  if (subtitleOverlay.hidden || !subtitleOverlay.textContent) return;
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return;
+  if (!floatingUi.hidden) {
+    const controlsRect = floatingUi.getBoundingClientRect();
+    subtitleOverlay.style.left = `${rect.left + rect.width / 2}px`;
+    subtitleOverlay.style.top = `${Math.max(48, controlsRect.top - 10)}px`;
+    subtitleOverlay.style.maxWidth = `${Math.max(240, Math.min(rect.width - 40, window.innerWidth - 48))}px`;
+  } else {
+    subtitleOverlay.style.left = `${window.innerWidth / 2}px`;
+    subtitleOverlay.style.top = `${window.innerHeight - 28}px`;
+    subtitleOverlay.style.maxWidth = `${Math.max(240, window.innerWidth - 48)}px`;
+  }
+}
+
+function resumeMoonshineAudioContextOnCreate(): void {
+  const audioWindow = window as Window & {
+    webkitAudioContext?: typeof AudioContext;
+  };
+  const OriginalAudioContext = window.AudioContext ?? audioWindow.webkitAudioContext;
+  if (!OriginalAudioContext || typeof Proxy === 'undefined') return;
+  const patched = new Proxy(OriginalAudioContext, {
+    construct(target, args) {
+      const context = Reflect.construct(target, args) as AudioContext;
+      void context.resume().catch(() => undefined);
+      const createMediaElementSource = context.createMediaElementSource.bind(context);
+      context.createMediaElementSource = ((mediaElement: HTMLMediaElement) => {
+        const source = createMediaElementSource(mediaElement);
+        const connect = source.connect.bind(source);
+        source.connect = ((destination: AudioNode, ...args: unknown[]) => {
+          if (destination === context.destination) return destination;
+          return connect(destination, ...(args as []));
+        }) as typeof source.connect;
+        return source;
+      }) as typeof context.createMediaElementSource;
+      if (window.AudioContext === patched) window.AudioContext = OriginalAudioContext;
+      if (audioWindow.webkitAudioContext === patched) audioWindow.webkitAudioContext = OriginalAudioContext;
+      return context;
+    },
+  });
+  if (window.AudioContext) window.AudioContext = patched;
+  if (audioWindow.webkitAudioContext) audioWindow.webkitAudioContext = patched;
+}
+
+async function startMoonshine(): Promise<void> {
+  if (!currentFile || moonshineStarting) return;
+  moonshineStarting = true;
+  moonshineToggleBtn.disabled = true;
+  moonshineStatus.textContent = moonshineLoaded ? 'Starting transcription...' : 'Downloading Moonshine model...';
+  try {
+    if (!moonshineLoaded) {
+      resumeMoonshineAudioContextOnCreate();
+      const Moonshine = await import(/* @vite-ignore */ moonshineUrl) as {
+        MediaElementTranscriber: new (
+          media: HTMLMediaElement,
+          model: string,
+          callbacks: {
+            onModelLoadStarted(): void;
+            onModelLoaded(): void;
+            onTranscriptionUpdated(text: string): void;
+            onTranscriptionCommitted(text: string): void;
+          },
+          vad?: boolean,
+        ) => unknown;
+      };
+      new Moonshine.MediaElementTranscriber(moonshineVideo, 'model/tiny', {
+        onModelLoadStarted() {
+          moonshineStatus.textContent = 'Downloading Moonshine model...';
+        },
+        onModelLoaded() {
+          moonshineStatus.textContent = player.playing
+            ? 'Listening and generating English captions.'
+            : 'Ready. Play the media to begin transcription.';
+        },
+        onTranscriptionUpdated(text) {
+          if (text) moonshineStatus.textContent = 'Listening; waiting for a stable caption...';
+        },
+        onTranscriptionCommitted(text) {
+          commitMoonshineCaption(text);
+        },
+      }, false);
+      moonshineLoaded = true;
+    }
+    moonshineEnabled = true;
+    moonshineVideo.muted = false;
+    moonshineVideo.currentTime = Math.min(player.duration, player.currentTime + moonshineLeadSeconds);
+    moonshineVideo.playbackRate = info
+      ? Math.max(0.25, Math.min(4, (player.getState().playbackFps ?? info.fps) / info.fps))
+      : 1;
+    if (player.playing) await moonshineVideo.play();
+    moonshineToggleBtn.textContent = 'Stop';
+    moonshineStatus.textContent = player.playing
+      ? 'Listening and generating English captions.'
+      : 'Ready. Play the media to begin transcription.';
+  } catch (error) {
+    moonshineEnabled = false;
+    moonshineStatus.textContent = `Moonshine failed: ${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    moonshineStarting = false;
+    moonshineToggleBtn.disabled = false;
+  }
+}
+
+function stopMoonshine(): void {
+  moonshineEnabled = false;
+  moonshinePlayPending = false;
+  moonshineVideo.pause();
+  moonshineToggleBtn.textContent = 'Start';
+  moonshineStatus.textContent = 'Stopped. Existing transcript remains available for translation.';
+  subtitleOverlay.hidden = true;
+}
+
+function syncMoonshinePlayback(): void {
+  if (!moonshineEnabled || !moonshineVideo.src) return;
+  const target = Math.min(player.duration, player.currentTime + moonshineLeadSeconds);
+  if (Math.abs(moonshineVideo.currentTime - target) > 0.45) moonshineVideo.currentTime = target;
+  const rate = info
+    ? Math.max(0.25, Math.min(4, (player.getState().playbackFps ?? info.fps) / info.fps))
+    : 1;
+  if (Math.abs(moonshineVideo.playbackRate - rate) > 0.001) moonshineVideo.playbackRate = rate;
+  if (player.playing && moonshineVideo.paused && !moonshinePlayPending) {
+    moonshinePlayPending = true;
+    void moonshineVideo.play()
+      .catch((error) => {
+        moonshineStatus.textContent = `Audio transcription could not start: ${error instanceof Error ? error.message : String(error)}`;
+      })
+      .finally(() => {
+        moonshinePlayPending = false;
+      });
+  }
+  if (!player.playing && !moonshineVideo.paused) moonshineVideo.pause();
+}
+
 setControlsEnabled(false);
 
 floatingUi.addEventListener('click', (e) => {
@@ -1116,6 +1363,7 @@ const player = new Player(canvas, {
     fitVideoToStage();
     dropHint.hidden = true;
     resumeBtn.hidden = true;
+    if (currentFile) resetMoonshineForFile(currentFile, i.hasAudio);
     setControlsEnabled(true);
     updateExportAvailability();
     scheduleTimelineThumbnails(true);
@@ -1123,14 +1371,24 @@ const player = new Player(canvas, {
   onTime(t) {
     updateTimeReadout(t);
   },
+  onPreparing(starting) {
+    playPauseBtn.textContent = starting ? 'Starting...' : (player.playing ? 'Pause' : 'Play');
+    playPauseBtn.disabled = starting || exportRunning;
+  },
   onState(playing) {
     playPauseBtn.textContent = playing ? 'Pause' : 'Play';
+    if (moonshineEnabled) {
+      moonshineStatus.textContent = playing
+        ? 'Listening and generating English captions.'
+        : 'Paused. Play the media to continue transcription.';
+    }
     if (playing) {
       pauseTimelineThumbnailWork(1500);
       hideTimelinePreview();
     } else {
       resumeTimelineThumbnailWork();
     }
+    syncMoonshinePlayback();
   },
   onInOut(inP, outP, loop) {
     loopBtn.textContent = `Loop: ${loop ? 'ON' : 'OFF'}`;
@@ -1182,6 +1440,9 @@ const timeline = new Timeline(timelineCanvas, {
 
 function uiLoop(): void {
   if (player.loaded) {
+    syncMoonshinePlayback();
+    updateSubtitleOverlayForTime();
+    positionSubtitleOverlay();
     timeline.render({
       duration: player.duration,
       currentTime: player.visibleFrameTime,
@@ -1250,6 +1511,11 @@ stage.addEventListener('dragover', (e) => {
 
 stage.addEventListener('dragleave', () => stage.classList.remove('dragover'));
 stage.addEventListener('drop', (e) => void onDrop(e));
+stage.addEventListener('dblclick', (e) => {
+  if (player.loaded || exportRunning || isInteractiveTarget(e.target)) return;
+  e.preventDefault();
+  void browseForMedia();
+});
 stage.addEventListener('contextmenu', (e) => {
   e.preventDefault();
   openScaleContextMenu(e.clientX, e.clientY);
@@ -1320,6 +1586,46 @@ async function onDrop(e: DragEvent): Promise<void> {
   pendingRestore = undefined;
   await openFile(file, handle);
 }
+
+async function browseForMedia(): Promise<void> {
+  const pickerWindow = window as Window & {
+    showOpenFilePicker?: (options?: {
+      multiple?: boolean;
+      types?: Array<{ description: string; accept: Record<string, string[]> }>;
+    }) => Promise<FileSystemFileHandle[]>;
+  };
+  if (pickerWindow.showOpenFilePicker) {
+    try {
+      const [handle] = await pickerWindow.showOpenFilePicker({
+        multiple: false,
+        types: [{
+          description: 'Media files',
+          accept: {
+            'video/*': ['.mp4', '.mov', '.webm', '.mkv'],
+            'audio/*': ['.mp3', '.m4a', '.wav', '.ogg', '.flac'],
+          },
+        }],
+      });
+      if (!handle) return;
+      pendingRestore = undefined;
+      await openFile(await handle.getFile(), handle);
+      return;
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return;
+      showError(error instanceof Error ? error.message : String(error));
+      return;
+    }
+  }
+  filePicker.click();
+}
+
+filePicker.addEventListener('change', () => {
+  const file = filePicker.files?.[0];
+  filePicker.value = '';
+  if (!file) return;
+  pendingRestore = undefined;
+  void openFile(file, null);
+});
 
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !exportDialog.hidden && !exportCloseBtn.disabled) {
@@ -1427,14 +1733,26 @@ volumeToggle.addEventListener('click', (e) => {
   setVolumePanelOpen(volumePanel.hidden);
 });
 volumePopover.addEventListener('click', (e) => e.stopPropagation());
+advancedBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  setAdvancedOpen(advancedPopover.hidden);
+});
+advancedPopover.addEventListener('click', (e) => e.stopPropagation());
+advancedCloseBtn.addEventListener('click', () => setAdvancedOpen(false));
+moonshineToggleBtn.addEventListener('click', () => {
+  if (moonshineEnabled) stopMoonshine();
+  else void startMoonshine();
+});
 document.addEventListener('click', () => {
   setVolumePanelOpen(false);
   closeScaleContextMenu();
+  setAdvancedOpen(false);
 });
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     setVolumePanelOpen(false);
     closeScaleContextMenu();
+    setAdvancedOpen(false);
   }
 });
 viewFitBtn.addEventListener('click', () => fitVideoToStage());
@@ -1498,7 +1816,10 @@ async function onResume(): Promise<void> {
 }
 
 setInterval(() => void persistNow(), 2000);
-window.addEventListener('pagehide', () => void persistNow());
+window.addEventListener('pagehide', () => {
+  void persistNow();
+  if (moonshineObjectUrl) URL.revokeObjectURL(moonshineObjectUrl);
+});
 
 async function init(): Promise<void> {
   if (typeof VideoDecoder === 'undefined' || typeof VideoFrame === 'undefined') {

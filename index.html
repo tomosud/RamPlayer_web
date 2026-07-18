@@ -27,8 +27,14 @@
       <div id="stage" class="stage">
         <canvas id="canvas"></canvas>
         <div id="dropHint" class="drop-hint">
-          <p>Drop a media file here</p>
+          <p>Drop a media file here or double-click to browse</p>
           <p class="sub">MP4 / MOV / WebM with WebCodecs-compatible codecs</p>
+        </div>
+        <input id="filePicker" type="file" accept="video/*,audio/*,.mp4,.mov,.webm,.mkv" hidden />
+        <div id="subtitleOverlay" class="subtitle-overlay" translate="yes" lang="en" hidden></div>
+        <div id="subtitleTranslationSource" class="subtitle-translation-source" translate="yes" lang="en" hidden></div>
+        <div id="moonshineHost" class="moonshine-host" aria-hidden="true">
+          <audio id="moonshineVideo" preload="auto"></audio>
         </div>
         <button id="resumeBtn" class="resume-btn" hidden>Reopen previous file</button>
       </div>
@@ -132,6 +138,23 @@
           <span><i class="sw sw-playhead"></i>Playhead</span>
         </div>
 
+        <div id="advancedPopover" class="advanced-popover" hidden>
+          <div class="advanced-head">
+            <strong>Advanced</strong>
+            <button id="advancedCloseBtn" class="icon-btn" aria-label="Close advanced controls">&times;</button>
+          </div>
+          <section class="advanced-section">
+            <div class="advanced-option-head">
+              <div>
+                <strong>Moonshine subtitles</strong>
+                <small>Generate English captions from the media audio in this browser.</small>
+              </div>
+              <button id="moonshineToggleBtn" disabled>Start</button>
+            </div>
+            <div id="moonshineStatus" class="advanced-status" aria-live="polite">Open a media file to enable.</div>
+          </section>
+        </div>
+        <button id="advancedBtn" class="advanced-btn" title="Advanced features" aria-label="Advanced features" aria-expanded="false">&#9881;</button>
         <button id="closeUiBtn" class="collapse-ui-btn" title="Hide controls" aria-label="Hide controls">▼</button>
       </section>
 

@@ -23,6 +23,7 @@ export interface LoadedInfo {
 export interface PlayerCallbacks {
   onLoaded(info: LoadedInfo): void;
   onTime(time: number): void;
+  onPreparing(starting: boolean): void;
   onState(playing: boolean): void;
   onInOut(inPoint: number, outPoint: number, loop: boolean): void;
   onError(message: string): void;
@@ -92,6 +93,7 @@ export class Player {
   fileName = '';
 
   private seekRunning = false;
+  private playStarting = false;
   private pendingSeekTime: number | null = null;
   private pendingStepDelta = 0;
   private stepQueueRunning = false;
@@ -327,36 +329,44 @@ export class Player {
   }
 
   async play(): Promise<void> {
-    if (!this.loaded || !this.audioContext || this.playing) return;
-    this.requestedStepPrefetchCenter = null;
-    this.interruptThumbnailWork();
-    this.stepGen++;
-    this.stepDecoding = false;
+    if (!this.loaded || !this.audioContext || this.playing || this.playStarting) return;
+    this.playStarting = true;
+    this.callbacks.onPreparing(true);
+    try {
+      this.requestedStepPrefetchCenter = null;
+      this.interruptThumbnailWork();
+      this.stepGen++;
+      this.stepDecoding = false;
 
-    this.currentTime = this.clampToPlaybackRange(this.currentTime);
-    if (this.currentTime < this.playbackStart || this.currentTime >= this.playbackEnd - this.eps) {
-      this.currentTime = this.playbackStart;
+      this.currentTime = this.clampToPlaybackRange(this.currentTime);
+      if (this.currentTime < this.playbackStart || this.currentTime >= this.playbackEnd - this.eps) {
+        this.currentTime = this.playbackStart;
+      }
+      this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
+
+      if (this.audioContext.state === 'suspended') await this.audioContext.resume();
+      if (!(await this.startVideoIterator())) return;
+
+      this.audioContextStartTime = this.audioContext.currentTime;
+      this.playing = true;
+      this.callbacks.onState(true);
+      // 再生に戻ったら予算が小さくなる。一時停止中に広げたキャッシュを再生予算まで縮める。
+      this.evictStepFrames(this.currentTime);
+
+      if (this.audioSink) {
+        void this.audioIterator?.return(undefined);
+        this.audioIterator = this.audioSink.buffers(this.playbackMediaAtStart, this.toMediaTime(this.playbackEnd));
+        void this.runAudioIterator(this.asyncId);
+      }
+
+      this.raf = requestAnimationFrame(this.tick);
+    } catch (error) {
+      this.stopPlaybackSideEffects();
+      this.callbacks.onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      this.playStarting = false;
+      this.callbacks.onPreparing(false);
     }
-    this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
-
-    if (this.audioContext.state === 'suspended') {
-      await this.audioContext.resume();
-    }
-
-    await this.startVideoIterator();
-    this.audioContextStartTime = this.audioContext.currentTime;
-    this.playing = true;
-    this.callbacks.onState(true);
-    // 再生に戻ったら予算が小さくなる。一時停止中に広げたキャッシュを再生予算まで縮める。
-    this.evictStepFrames(this.currentTime);
-
-    if (this.audioSink) {
-      void this.audioIterator?.return(undefined);
-      this.audioIterator = this.audioSink.buffers(this.playbackMediaAtStart, this.toMediaTime(this.playbackEnd));
-      void this.runAudioIterator(this.asyncId);
-    }
-
-    this.raf = requestAnimationFrame(this.tick);
   }
 
   pause(): void {
@@ -371,8 +381,13 @@ export class Player {
   }
 
   toggle(): void {
+    if (this.playStarting) return;
     if (this.playing) this.pause();
     else void this.play();
+  }
+
+  get startingPlayback(): boolean {
+    return this.playStarting;
   }
 
   private tick = (): void => {
@@ -409,18 +424,23 @@ export class Player {
   }
 
   private async updateNextFrame(id: number): Promise<void> {
-    if (!this.videoIterator) return;
-    while (id === this.asyncId) {
-      const next = await this.videoIterator.next();
-      const frame = next.value ?? null;
-      if (!frame || id !== this.asyncId) break;
+    const iterator = this.videoIterator;
+    if (!iterator) return;
+    try {
+      while (id === this.asyncId) {
+        const next = await iterator.next();
+        const frame = next.value ?? null;
+        if (!frame || id !== this.asyncId) break;
 
-      if (frame.timestamp <= this.toLookupMediaTime(this.currentTime)) {
-        this.blit(frame);
-      } else {
-        this.nextFrame = frame;
-        break;
+        if (frame.timestamp <= this.toLookupMediaTime(this.currentTime)) {
+          this.blit(frame);
+        } else {
+          this.nextFrame = frame;
+          break;
+        }
       }
+    } catch {
+      // Iterator cancellation during seek/dispose is expected.
     }
   }
 
@@ -1033,17 +1053,25 @@ export class Player {
     return best;
   }
 
-  private async startVideoIterator(drawFirst = false): Promise<void> {
+  private async startVideoIterator(drawFirst = false): Promise<boolean> {
     this.asyncId++;
     const id = this.asyncId;
     this.nextFrame = null;
     await this.stopVideoIterator();
-    if (!this.videoSink) return;
+    if (id !== this.asyncId || !this.videoSink) return false;
 
-    this.videoIterator = this.videoSink.canvases(this.toMediaTime(this.currentTime), this.toMediaTime(this.playbackEnd));
-    const first = (await this.videoIterator.next()).value ?? null;
-    const second = (await this.videoIterator.next()).value ?? null;
-    if (id !== this.asyncId) return;
+    const iterator = this.videoSink.canvases(this.toMediaTime(this.currentTime), this.toMediaTime(this.playbackEnd));
+    this.videoIterator = iterator;
+    let first: WrappedCanvas | null;
+    let second: WrappedCanvas | null;
+    try {
+      first = (await iterator.next()).value ?? null;
+      second = (await iterator.next()).value ?? null;
+    } catch (error) {
+      if (id !== this.asyncId || this.videoIterator !== iterator) return false;
+      throw error;
+    }
+    if (id !== this.asyncId || this.videoIterator !== iterator) return false;
     if (!first) {
       this.logVideoIssue('video iterator did not return an initial frame', {
         currentTime: this.currentTime,
@@ -1060,6 +1088,7 @@ export class Player {
     } else {
       this.nextFrame = first;
     }
+    return true;
   }
 
   private canRunThumbnailWork(gen: number): boolean {
