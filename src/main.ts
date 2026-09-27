@@ -1072,7 +1072,7 @@ function updateMediaInfo(): void {
     : '';
   mediaInfo.textContent = `${fmt(info.duration)} / ${info.width}x${info.height}${renderSize} / ${fmtFps(info.fps)}fps source / ${playback} / ${
     info.hasAudio ? 'audio' : 'no audio'
-  }`;
+  }${info.videoBackend ? ' / FFV1 / 8-bit preview' : ''}${info.ramPlayback ? ' / RAM playback' : ''}`;
 }
 
 function syncPlaybackFpsControls(): void {
@@ -1502,6 +1502,14 @@ floatingUi.addEventListener('click', (e) => {
 });
 
 const player = new Player(canvas, {
+  onRamPreparation(progress) {
+    const status = $<HTMLDivElement>('ramPreparation');
+    status.hidden = progress === null;
+    if (progress) {
+      setControlsEnabled(false);
+      status.textContent = `Preparing RAM playback... ${Math.min(99, Math.floor(progress.frames / progress.estimatedFrames * 100))}% (${progress.frames} frames, ${Math.round(progress.bytes / 1024 / 1024)} MB)`;
+    }
+  },
   onLoaded(i) {
     info = i;
     resetTimelineThumbnails();

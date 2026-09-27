@@ -844,3 +844,16 @@ button.active {
     width: 120px;
   }
 }
+.ram-preparation {
+  position: fixed;
+  top: 64px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 30;
+  padding: 12px 18px;
+  max-width: calc(100vw - 40px);
+  background: var(--panel-solid);
+  color: var(--text);
+  border-radius: 6px;
+  pointer-events: none;
+}

@@ -160,6 +160,10 @@ export async function analyzeCopyMp4Export(options: {
 }): Promise<CopyExportPlan> {
   const requestedInPoint = options.inPoint;
   const requestedOutPoint = options.outPoint;
+  if (options.info.videoBackend) {
+    return { canCopy: false, reason: 'FFV1 cannot be copied into MP4. Use H.264 re-encoding.',
+      requestedInPoint, requestedOutPoint, inPoint: requestedInPoint, outPoint: requestedOutPoint, adjusted: false };
+  }
   let input: Awaited<ReturnType<typeof getCopyTracks>>['input'] | null = null;
 
   try {
@@ -504,6 +508,17 @@ export async function exportMp4Clip(options: ExportClipOptions): Promise<ExportC
     throwIfAborted(options.signal);
     const canAudio = await canEncodeAudio('aac', { bitrate: plan.audioBitrate });
     if (!canAudio) throw new Error('This browser cannot encode AAC audio.');
+  }
+
+  if (options.info.videoBackend) {
+    const { exportFallbackVideo } = await import('./fallbackExport');
+    const blob = await exportFallbackVideo(options, plan);
+    return {
+      blob,
+      filename: `${sanitizeFilenamePart(options.file.name)}_${marker(options.inPoint)}-${marker(options.outPoint)}.mp4`,
+      plan, compressionMode: 'reencode',
+      actualInPoint: options.inPoint, actualOutPoint: options.outPoint,
+    };
   }
 
   const input = new Input({

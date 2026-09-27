@@ -11,6 +11,7 @@ RamPlayer Web は、アニメーション制作や映像確認時のコマ送り
 ## 主な機能
 
 - MP4 / MOV / WebMなど、WebCodecsでデコード可能なローカル動画の再生
+- FFV1入りMKVのWASMデコード（RGB 16bit入力対応、表示は8bit）
 - ドラッグ＆ドロップ、または未読込画面のダブルクリックによるファイル選択
 - `←` / `→` または `Prev` / `Next` による1フレーム単位のコマ送り
 - 一時停止中の前後フレームキャッシュとフィルムストリップ表示
@@ -33,6 +34,34 @@ RamPlayer Web は、アニメーション制作や映像確認時のコマ送り
 4Kなどの重い動画では、Mediabunnyの再生用Canvasを実際の画面サイズに合わせて縮小します。元動画の解像度は維持され、クリップ書き出しには元解像度が使用されます。
 
 通常再生中は、コマ送りキャッシュ、フィルムストリップ更新、タイムラインサムネイル生成を停止して再生処理を優先します。一時停止すると必要なコマ送りキャッシュを再構築します。
+
+## FFV1 / MKV
+
+WebCodecsで映像をデコードできないMKVでは、FFV1用のFFmpeg WASMを必要時だけ読み込みます。動画は外部へ送信しません。初回に約32MBのWASMを読み込み、Worker内のWORKERFSからファイルを必要に応じて読みます。動画全体をWASMメモリへコピーしたり、中間動画を作成したりしません。
+
+再生、シーク、コマ送り、サムネイル、PNG保存、H.264 MP4クリップ書き出しに対応します。FFV1のMP4への無再圧縮コピーはできません。音声は従来のMediabunny経路でブラウザがデコードできる形式に限ります。
+
+RGB各16bitの入力もデコードできますが、表示・PNG・MP4出力にはRGBA 8bitへ変換したフレームを使います。16bit保存や厳密な色評価用の出力ではありません。元ファイルは変更しません。
+
+FFV1動画は、全フレームのRGBA 8bitデータがRAM予算に収まる場合、全編を準備してから操作可能になります。準備中は進捗を表示し、完了後は `RAM playback` と表示します。通常再生・シーク・コマ送り・サムネイル・PNG保存は同じRAMキャッシュを参照し、WASMを再実行しません。準備完了時にはデコーダーのWorkerも解放します。MP4書き出しは別のデコーダーを使用します。
+
+RAM予算はブラウザの `deviceMemory`（未提供なら4GB）の40%、上限1GiBです。フィルムストリップなどの表示用キャッシュとデコード中のバッチ分を確保した残りを全編キャッシュに使います。事前の見積もりに加え、準備中も実使用量を確認します。予算を超える場合は全編キャッシュを解放し、従来の必要部分だけをデコードする方式に戻ります。ファイル切り替え時には準備を中断し、キャッシュを解放します。
+
+最初の準備には単一スレッドWASMのデコード時間がかかります。予算外で逐次デコードする場合は実時間再生に追いつかないことがあります。出力バッチの目安は32MiB（1フレームがそれ以上なら1枚）です。RAM表示は保持フレームの推定量であり、WASMやブラウザ内部のメモリを含むプロセス全体の上限ではありません。確認済み素材は1344×768・24fps・RGB 16bitのFFV1 MKVです。
+
+### デコーダーの拡張
+
+Mediabunnyは改造していません。`src/media/VideoFrameSource.ts` の `VideoFrameSource` をプレイヤーの共通窓口とし、通常は `VideoSampleSink`、追加形式は `VideoBackend` を使用します。`VideoBackendProvider` の一覧に判定とファクトリーを追加すると、別のデコーダーを接続できます。各バックエンドは実フレーム時刻、シーク、所有権のある `VideoSample`、`dispose()` と読み込みキャンセルを提供します。現状のFFmpegバックエンドはFFV1のみを許可しています。
+
+FFV1経路のブラウザ回帰テストは、開発サーバーを起動した状態で実行できます。テスト用MKVはリポジトリに含めません。24fps・4秒以上のFFV1素材を指定してください。
+
+```bash
+npm run dev -- --host 127.0.0.1 --port 8123
+npm run test:ffv1 -- path/to/master_ffv1_rgb16.mkv
+node tests/ram-cache-smoke.cjs
+```
+
+WindowsではEdge、その他ではPlaywrightのChromiumを使います。`TEST_BROWSER_PATH` でブラウザ実行ファイル、`TEST_BASE_URL` で開発サーバーURLを指定できます。テストは連続フレーム時刻、シーク、キャンセル、MP4出力、コマ送り、再生、通常MP4への切り替えを確認します。
 
 ## Advanced機能
 
@@ -130,6 +159,7 @@ Windowsでは `run.bat` から `dist/` をローカル配信できます。
 ## 使用技術
 
 - [Mediabunny](https://github.com/Vanilagy/mediabunny) - メディア読み込み、トラック解析、Canvas / AudioBuffer出力、MP4処理
+- [FFmpeg WASM](https://github.com/ffmpegwasm/ffmpeg.wasm) - FFV1用の追加デコーダー（必要時のみ読み込み）
 - [MoonshineJS](https://github.com/moonshine-ai/moonshine-js) - ブラウザ内音声認識
 - [Vite](https://github.com/vitejs/vite) - 開発サーバーとビルド
 - [TypeScript](https://github.com/microsoft/TypeScript) - 型付きJavaScript開発環境

@@ -11,6 +11,8 @@ import {
   type WrappedAudioBuffer,
 } from 'mediabunny';
 import type { CacheRange } from './FrameCache';
+import { openFallbackVideo, type VideoBackend, type VideoFrameSource } from '../media/VideoFrameSource';
+import { RamVideoBackend, type RamPreparationProgress } from '../media/RamVideoBackend';
 import { computeViewMapping, type ViewState } from './view';
 
 export interface LoadedInfo {
@@ -23,11 +25,14 @@ export interface LoadedInfo {
   fps: number;
   hasAudio: boolean;
   videoCodec?: string;
+  videoBackend?: string;
+  ramPlayback?: boolean;
   audioCodec?: string;
   audioSampleRate?: number;
 }
 
 export interface PlayerCallbacks {
+  onRamPreparation?(progress: RamPreparationProgress | null): void;
   onLoaded(info: LoadedInfo): void;
   onTime(time: number): void;
   onPreparing(starting: boolean): void;
@@ -69,8 +74,12 @@ const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 export class Player {
   private ctx2d: CanvasRenderingContext2D;
   private input: Input | null = null;
-  private videoSink: VideoSampleSink | null = null;
-  private detailSink: VideoSampleSink | null = null;
+  private fallbackVideo: VideoBackend | null = null;
+  private ramVideo: RamVideoBackend | null = null;
+  private loading = false;
+  private loadAbort: AbortController | null = null;
+  private videoSink: VideoFrameSource | null = null;
+  private detailSink: VideoFrameSource | null = null;
   private thumbnailSink: CanvasSink | null = null;
   private thumbnailPacketSink: EncodedPacketSink | null = null;
   private thumbnailUnavailable = false;
@@ -149,6 +158,7 @@ export class Player {
 
   /** 現在の状態に応じたフレームキャッシュ予算（バイト）。一時停止中は大きく取る。 */
   private get frameBudgetBytes(): number {
+    if (this.ramVideo?.ready) return Math.min(128 * 1024 * 1024, Math.max(0, this.pausedBudgetBytes - this.ramVideo.cacheBytes));
     return this.playing ? this.playingBudgetBytes : this.pausedBudgetBytes;
   }
 
@@ -181,7 +191,7 @@ export class Player {
   }
 
   get loaded(): boolean {
-    return this.input !== null;
+    return this.input !== null && !this.loading;
   }
 
   get baseDisplayWidth(): number { return this.baseRenderWidth; }
@@ -200,160 +210,210 @@ export class Player {
   }
 
   async load(file: File, restore?: RestoreState): Promise<void> {
+    this.loadAbort?.abort();
+    const loadAbort = new AbortController();
     const loadGeneration = ++this.loadGeneration;
     const guardLoad = () => {
+      loadAbort.signal.throwIfAborted();
       if (loadGeneration !== this.loadGeneration) throw new DOMException('Load was superseded.', 'AbortError');
     };
 
     await this.dispose();
     guardLoad();
+    this.loadAbort = loadAbort;
+    this.loading = true;
     this.fileName = file.name;
     this.thumbnailUnavailable = false;
 
-    const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
-    this.input = input;
+    try {
+      const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
+      this.input = input;
 
-    if (!(await input.canRead())) {
+      const canRead = await input.canRead();
       guardLoad();
-      throw new Error('This media file cannot be read. Please use MP4, MOV, WebM, or another supported format.');
-    }
-    guardLoad();
 
-    let videoTrack = await input.getPrimaryVideoTrack();
-    let audioTrack = await input.getPrimaryAudioTrack();
-    guardLoad();
-
-    let videoCodec = videoTrack ? await videoTrack.getCodec() : null;
-    let audioCodec = audioTrack ? await audioTrack.getCodec() : null;
-    if (videoTrack && (!videoCodec || !(await videoTrack.canDecode()))) {
+      let videoTrack = canRead ? await input.getPrimaryVideoTrack() : null;
+      let audioTrack = canRead ? await input.getPrimaryAudioTrack() : null;
       guardLoad();
-      videoTrack = null;
-      videoCodec = null;
-    }
-    if (audioTrack && (!audioCodec || !(await audioTrack.canDecode()))) {
-      guardLoad();
-      audioTrack = null;
-      audioCodec = null;
-    }
-    guardLoad();
-    if (!videoTrack && !audioTrack) {
-      throw new Error('No decodable audio or video track was found.');
-    }
 
-    const tracks: InputTrack[] = [videoTrack, audioTrack].filter((t): t is NonNullable<typeof t> => t !== null);
-    const firstTimestamp = Math.max(await input.getFirstTimestamp(tracks), 0);
-    guardLoad();
-    this.firstTimestamp = firstTimestamp;
-    const endTimestamp = await this.resolveEndTimestamp(input, tracks);
-    guardLoad();
-    this.duration = Math.max(0, endTimestamp - this.firstTimestamp);
-    if (this.duration <= 0) throw new Error('Could not determine a valid media duration.');
-
-    if (videoTrack) {
-      const videoCanBeTransparent = await videoTrack.canBeTransparent();
-      const displayWidth = await videoTrack.getDisplayWidth();
-      const displayHeight = await videoTrack.getDisplayHeight();
-      this.sourceWidth = displayWidth;
-      this.sourceHeight = displayHeight;
-      let fps = 30;
-      try {
-        const stats = await videoTrack.computePacketStats(120);
-        if (stats.averagePacketRate > 0) fps = stats.averagePacketRate;
-      } catch {
-        fps = 30;
+      let videoCodec: string | null = videoTrack ? await videoTrack.getCodec() : null;
+      let audioCodec = audioTrack ? await audioTrack.getCodec() : null;
+      if (videoTrack && (!videoCodec || !(await videoTrack.canDecode()))) {
+        guardLoad();
+        videoTrack = null;
+        videoCodec = null;
+      }
+      if (audioTrack && (!audioCodec || !(await audioTrack.canDecode()))) {
+        guardLoad();
+        audioTrack = null;
+        audioCodec = null;
       }
       guardLoad();
-      const renderScale = Math.min(
-        1,
-        Math.max(640, window.innerWidth) / displayWidth,
-        Math.max(360, window.innerHeight) / displayHeight,
-      );
-      const renderWidth = Math.max(1, Math.round(displayWidth * renderScale));
-      const renderHeight = Math.max(1, Math.round(displayHeight * renderScale));
-      this.videoSink = new VideoSampleSink(videoTrack, { optimizeForLatency: true });
-      this.detailSink = new VideoSampleSink(videoTrack, { optimizeForLatency: true });
-
-      this.thumbnailSink = new CanvasSink(videoTrack, {
-        poolSize: 1,
-        width: 180,
-        height: 102,
-        fit: 'cover',
-        alpha: videoCanBeTransparent,
-      });
-      this.thumbnailPacketSink = new EncodedPacketSink(videoTrack);
-      this.canvas.width = renderWidth;
-      this.canvas.height = renderHeight;
-      this.baseRenderWidth = renderWidth;
-      this.baseRenderHeight = renderHeight;
-      this.canvas.style.width = `${renderWidth}px`;
-      this.canvas.style.height = `${renderHeight}px`;
-      this.fps = fps;
-    } else {
+      const fallback = !videoTrack ? await openFallbackVideo(file, loadAbort.signal) : null;
       guardLoad();
-      this.canvas.width = 1;
-      this.canvas.height = 1;
-      this.sourceWidth = 1;
-      this.sourceHeight = 1;
-      this.videoSink = null;
-      this.detailSink = null;
-      this.thumbnailSink = null;
-      this.thumbnailPacketSink = null;
-    }
-    this.frameDuration = 1 / this.fps;
-    this.playbackFps = this.sanitizePlaybackFps(restore?.playbackFps ?? null);
+      this.fallbackVideo = fallback;
+      if (fallback) {
+        videoCodec = `${fallback.info.codec} (WASM, 8-bit display)`;
+        if (fallback.info.hasAudio && !audioTrack) {
+          fallback.dispose();
+          throw new Error('This fallback video has audio that cannot be decoded by this browser.');
+        }
+      }
+      if (!videoTrack && !audioTrack && !fallback) {
+        throw new Error('No decodable audio or video track was found.');
+      }
 
-    // フレームキャッシュ予算をこの動画の解像度・実機RAMから確定する。
-    // 1枚 = 表示幅×高さ×RGBA(4byte)。deviceMemory(GB) の 40% を上限1GBで一時停止予算とする。
-    this.bytesPerFrame = Math.max(1, this.canvas.width * this.canvas.height * 4);
-    const deviceMemoryGB = (navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 4;
-    this.pausedBudgetBytes = Math.min(deviceMemoryGB * 1024 * 0.4, 1024) * 1024 * 1024;
+      const tracks: InputTrack[] = [videoTrack, audioTrack].filter((t): t is NonNullable<typeof t> => t !== null);
+      const firstTimestamp = fallback ? fallback.info.firstTimestamp : Math.max(await input.getFirstTimestamp(tracks), 0);
+      guardLoad();
+      this.firstTimestamp = firstTimestamp;
+      const endTimestamp = fallback ? firstTimestamp + fallback.info.duration : await this.resolveEndTimestamp(input, tracks);
+      guardLoad();
+      this.duration = Math.max(0, endTimestamp - this.firstTimestamp);
+      if (this.duration <= 0) throw new Error('Could not determine a valid media duration.');
 
-    const audioSampleRate = audioTrack ? await audioTrack.getSampleRate() : undefined;
-    guardLoad();
-    const AudioContextCtor = window.AudioContext;
-    this.audioContext = new AudioContextCtor({
-      sampleRate: audioSampleRate,
-    });
-    this.gainNode = this.audioContext.createGain();
-    this.gainNode.connect(this.audioContext.destination);
-    this.audioCaptureDestination = this.audioContext.createMediaStreamDestination();
-    this.setVolume(this.volume);
+      if (videoTrack) {
+        const videoCanBeTransparent = await videoTrack.canBeTransparent();
+        const displayWidth = await videoTrack.getDisplayWidth();
+        const displayHeight = await videoTrack.getDisplayHeight();
+        this.sourceWidth = displayWidth;
+        this.sourceHeight = displayHeight;
+        let fps = 30;
+        try {
+          const stats = await videoTrack.computePacketStats(120);
+          if (stats.averagePacketRate > 0) fps = stats.averagePacketRate;
+        } catch {
+          fps = 30;
+        }
+        guardLoad();
+        const renderScale = Math.min(
+          1,
+          Math.max(640, window.innerWidth) / displayWidth,
+          Math.max(360, window.innerHeight) / displayHeight,
+        );
+        const renderWidth = Math.max(1, Math.round(displayWidth * renderScale));
+        const renderHeight = Math.max(1, Math.round(displayHeight * renderScale));
+        this.videoSink = new VideoSampleSink(videoTrack, { optimizeForLatency: true });
+        this.detailSink = new VideoSampleSink(videoTrack, { optimizeForLatency: true });
 
-    this.audioSink = audioTrack ? new AudioBufferSink(audioTrack) : null;
+        this.thumbnailSink = new CanvasSink(videoTrack, {
+          poolSize: 1,
+          width: 180,
+          height: 102,
+          fit: 'cover',
+          alpha: videoCanBeTransparent,
+        });
+        this.thumbnailPacketSink = new EncodedPacketSink(videoTrack);
+        this.canvas.width = renderWidth;
+        this.canvas.height = renderHeight;
+        this.baseRenderWidth = renderWidth;
+        this.baseRenderHeight = renderHeight;
+        this.canvas.style.width = `${renderWidth}px`;
+        this.canvas.style.height = `${renderHeight}px`;
+        this.fps = fps;
+      } else if (fallback) {
+        this.videoSink = fallback;
+        this.detailSink = fallback;
+        this.sourceWidth = fallback.info.width;
+        this.sourceHeight = fallback.info.height;
+        this.fps = fallback.info.fps;
+        const scale = Math.min(1, Math.max(640, window.innerWidth) / this.sourceWidth, Math.max(360, window.innerHeight) / this.sourceHeight);
+        this.baseRenderWidth = this.canvas.width = Math.max(1, Math.round(this.sourceWidth * scale));
+        this.baseRenderHeight = this.canvas.height = Math.max(1, Math.round(this.sourceHeight * scale));
+        this.canvas.style.width = `${this.canvas.width}px`;
+        this.canvas.style.height = `${this.canvas.height}px`;
+      } else {
+        guardLoad();
+        this.canvas.width = 1;
+        this.canvas.height = 1;
+        this.sourceWidth = 1;
+        this.sourceHeight = 1;
+        this.videoSink = null;
+        this.detailSink = null;
+        this.thumbnailSink = null;
+        this.thumbnailPacketSink = null;
+      }
+      this.frameDuration = 1 / this.fps;
+      this.playbackFps = this.sanitizePlaybackFps(restore?.playbackFps ?? null);
 
-    this.inPoint = clamp(restore?.inPoint ?? 0, 0, this.duration);
-    this.outPoint = clamp(restore?.outPoint ?? this.duration, this.inPoint, this.duration);
-    if (this.outPoint <= this.inPoint + this.eps) this.outPoint = this.duration;
-    this.inPointSet = restore?.inPointSet ?? this.inPoint > this.eps;
-    this.outPointSet = restore?.outPointSet ?? this.outPoint < this.duration - this.eps;
-    this.loop = restore?.loop ?? true;
-    this.currentTime = clamp(restore?.lastTime ?? 0, 0, this.duration);
-    this.currentTime = this.clampToPlaybackRange(this.currentTime);
-    this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
+      // フレームキャッシュ予算をこの動画の解像度・実機RAMから確定する。
+      // 1枚 = 表示幅×高さ×RGBA(4byte)。deviceMemory(GB) の 40% を上限1GBで一時停止予算とする。
+      this.bytesPerFrame = Math.max(1, this.canvas.width * this.canvas.height * 4);
+      const deviceMemoryGB = (navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 4;
+      this.pausedBudgetBytes = Math.min(deviceMemoryGB * 1024 * 0.4, 1024) * 1024 * 1024;
 
-    this.callbacks.onLoaded({
-      name: this.fileName,
-      duration: this.duration,
-      width: this.sourceWidth,
-      height: this.sourceHeight,
-      renderWidth: this.canvas.width,
-      renderHeight: this.canvas.height,
-      fps: this.fps,
-      hasAudio: this.audioSink !== null,
-      videoCodec: videoCodec ?? undefined,
-      audioCodec: audioCodec ?? undefined,
-      audioSampleRate,
-    });
-    this.callbacks.onInOut(this.inPoint, this.outPoint, this.loop);
+      if (fallback) {
+        const cached = new RamVideoBackend(fallback);
+        this.ramVideo = cached;
+        this.fallbackVideo = cached;
+        // Reserve room for filmstrip canvases and an in-flight decoder batch.
+        const reserve = Math.max(128 * 1024 * 1024, 24 * this.bytesPerFrame) + 32 * 1024 * 1024;
+        try {
+          await cached.prepare(Math.max(0, this.pausedBudgetBytes - reserve), loadAbort.signal, progress => {
+            guardLoad();
+            this.callbacks.onRamPreparation?.(progress);
+          });
+          guardLoad();
+          this.videoSink = cached;
+          this.detailSink = cached;
+        } finally {
+          if (loadGeneration === this.loadGeneration) this.callbacks.onRamPreparation?.(null);
+        }
+      }
 
-    const initialFrame = await this.drawAt(this.currentTime);
-    guardLoad();
-    if (initialFrame) {
-      this.currentTime = this.clampToPlaybackRange(initialFrame.time);
+      const audioSampleRate = audioTrack ? await audioTrack.getSampleRate() : undefined;
+      guardLoad();
+      const AudioContextCtor = window.AudioContext;
+      this.audioContext = new AudioContextCtor({
+        sampleRate: audioSampleRate,
+      });
+      this.gainNode = this.audioContext.createGain();
+      this.gainNode.connect(this.audioContext.destination);
+      this.audioCaptureDestination = this.audioContext.createMediaStreamDestination();
+      this.setVolume(this.volume);
+
+      this.audioSink = audioTrack ? new AudioBufferSink(audioTrack) : null;
+
+      this.inPoint = clamp(restore?.inPoint ?? 0, 0, this.duration);
+      this.outPoint = clamp(restore?.outPoint ?? this.duration, this.inPoint, this.duration);
+      if (this.outPoint <= this.inPoint + this.eps) this.outPoint = this.duration;
+      this.inPointSet = restore?.inPointSet ?? this.inPoint > this.eps;
+      this.outPointSet = restore?.outPointSet ?? this.outPoint < this.duration - this.eps;
+      this.loop = restore?.loop ?? true;
+      this.currentTime = clamp(restore?.lastTime ?? 0, 0, this.duration);
+      this.currentTime = this.clampToPlaybackRange(this.currentTime);
       this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
+
+      this.loading = false;
+      this.callbacks.onLoaded({
+        name: this.fileName,
+        duration: this.duration,
+        width: this.sourceWidth,
+        height: this.sourceHeight,
+        renderWidth: this.canvas.width,
+        renderHeight: this.canvas.height,
+        fps: this.fps,
+        hasAudio: this.audioSink !== null,
+        videoCodec: videoCodec ?? undefined,
+        videoBackend: fallback?.info.backend,
+        ramPlayback: this.ramVideo?.ready ?? false,
+        audioCodec: audioCodec ?? undefined,
+        audioSampleRate,
+      });
+      this.callbacks.onInOut(this.inPoint, this.outPoint, this.loop);
+
+      const initialFrame = await this.drawAt(this.currentTime);
+      guardLoad();
+      if (initialFrame) {
+        this.currentTime = this.clampToPlaybackRange(initialFrame.time);
+        this.playbackMediaAtStart = this.toMediaTime(this.currentTime);
+      }
+      this.scheduleStepPrefetch(this.currentTime);
+      this.callbacks.onTime(this.currentTime);
+    } catch (error) {
+      if (loadGeneration === this.loadGeneration) await this.dispose();
+      throw error;
     }
-    this.scheduleStepPrefetch(this.currentTime);
-    this.callbacks.onTime(this.currentTime);
   }
 
   private async resolveEndTimestamp(input: Input, tracks: InputTrack[]): Promise<number> {
@@ -842,6 +902,11 @@ export class Player {
 
         this.requestedStepPrefetchCenter = this.currentTime;
       }
+    } catch (error) {
+      if (loopGen === this.stepPrefetchLoopGen) {
+        this.requestedStepPrefetchCenter = null;
+        this.callbacks.onError(error instanceof Error ? error.message : String(error));
+      }
     } finally {
       if (loopGen === this.stepPrefetchLoopGen) this.stepPrefetchRunning = false;
       if (
@@ -1252,6 +1317,7 @@ export class Player {
   }
 
   async thumbnailAt(time: number, width: number, height: number): Promise<HTMLCanvasElement | null> {
+    if (this.fallbackVideo) return this.fallbackThumbnailAt(time, width, height);
     const gen = this.thumbnailWorkGen;
     if (!this.thumbnailSink || this.thumbnailUnavailable || !this.canRunThumbnailWork(gen)) return null;
     try {
@@ -1282,6 +1348,7 @@ export class Player {
   }
 
   async keyframeThumbnailAt(time: number, width: number, height: number): Promise<HTMLCanvasElement | null> {
+    if (this.fallbackVideo) return this.fallbackThumbnailAt(time, width, height);
     const gen = this.thumbnailWorkGen;
     if (!this.thumbnailSink || this.thumbnailUnavailable || !this.canRunThumbnailWork(gen)) return null;
     if (!this.thumbnailPacketSink) return null;
@@ -1310,6 +1377,30 @@ export class Player {
       if (!this.canRunThumbnailWork(gen)) return null;
       return null;
     }
+  }
+
+  private async fallbackThumbnailAt(time: number, width: number, height: number): Promise<HTMLCanvasElement | null> {
+    const gen = this.thumbnailWorkGen;
+    if (!this.fallbackVideo || !this.canRunThumbnailWork(gen)) return null;
+    let sample: VideoSample | null;
+    try {
+      sample = await this.fallbackVideo.getSample(this.toLookupMediaTime(time));
+    } catch (error) {
+      if (!this.canRunThumbnailWork(gen)) return null;
+      this.callbacks.onError(error instanceof Error ? error.message : String(error));
+      return null;
+    }
+    if (!sample) return null;
+    try {
+      if (!this.canRunThumbnailWork(gen)) return null;
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(width));
+      canvas.height = Math.max(1, Math.round(height));
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return null;
+      sample.draw(ctx, 0, 0, canvas.width, canvas.height);
+      return canvas;
+    } finally { sample.close(); }
   }
 
   private resizeOutputCanvas(sourceWidth = this.sourceWidth, sourceHeight = this.sourceHeight): void {
@@ -1582,6 +1673,7 @@ export class Player {
   }
 
   cacheRanges(): CacheRange[] {
+    if (this.ramVideo?.ready) return [{ start: 0, end: this.duration }];
     if (this.stepKeys.length === 0) return [];
     const out: CacheRange[] = [];
     const maxGap = Math.max(this.frameDuration * 1.8, 0.08);
@@ -1603,26 +1695,28 @@ export class Player {
   }
 
   get decodingFrom(): number {
+    if (this.ramVideo?.ready) return 0;
     return this.stepDecoding ? this.stepDecodingFrom : 0;
   }
 
   get decodingTo(): number {
+    if (this.ramVideo?.ready) return 0;
     return this.stepDecoding ? this.stepDecodingTo : 0;
   }
 
   /** 現在キャッシュしているフレーム枚数。 */
   get cacheFrameCount(): number {
-    return this.stepFrames.size;
+    return this.ramVideo?.ready ? this.ramVideo.frameCount : this.stepFrames.size;
   }
 
   /** フレームキャッシュの推定使用バイト数（枚数 × 1フレームbytes）。 */
   get cacheBytes(): number {
-    return this.stepFrames.size * this.bytesPerFrame;
+    return this.stepFrames.size * this.bytesPerFrame + (this.ramVideo?.cacheBytes ?? 0);
   }
 
   /** 現在状態でのフレームキャッシュ予算（バイト）。 */
   get cacheBudgetBytes(): number {
-    return this.frameBudgetBytes;
+    return this.ramVideo?.ready ? this.pausedBudgetBytes : this.frameBudgetBytes;
   }
 
   stepStripFrames(): StepFrame[] {
@@ -1696,6 +1790,13 @@ export class Player {
   }
 
   async dispose(): Promise<void> {
+    this.loading = false;
+    this.callbacks.onRamPreparation?.(null);
+    this.loadAbort?.abort();
+    this.loadAbort = null;
+    this.fallbackVideo?.dispose();
+    this.fallbackVideo = null;
+    this.ramVideo = null;
     this.requestedStepPrefetchCenter = null;
     this.interruptThumbnailWork();
     this.workGen++;
